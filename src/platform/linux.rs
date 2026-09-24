@@ -44,7 +44,8 @@ const TERM_SCREEN_256COLOR: &str = "screen-256color";
 const TERM_XTERM: &str = "xterm";
 
 lazy_static::lazy_static! {
-    pub static ref IS_X11: bool = hbb_common::platform::linux::is_x11_or_headless();
+    // Shared with scrap::is_x11() through hbb_common, so the two can never disagree.
+    pub static ref IS_X11: bool = hbb_common::platform::linux::is_x11_or_headless_cached();
     // Cache for TERM value - once TERM_XTERM_256COLOR is found, reuse it directly
     static ref CACHED_TERM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     static ref DATABASE_XTERM_256COLOR: Option<Database> = {

@@ -259,37 +259,36 @@ pub struct EncodeYuvFormat {
     pub v: usize,
 }
 
-/// Computed once per process. Uncached, every call ran `loginctl` four times (list-sessions twice,
-/// show-session State and Type), and display_service polls `Display::all()` -- which asks this --
-/// every 300 ms: ~800 process launches a minute while a client is connected. The rest of the process
-/// already treats the answer as fixed for its lifetime (`IS_X11` in src/platform/linux.rs, used by the
-/// input, clipboard and display paths), and the service restarts `--server` when the session's user,
-/// display or xauth changes and after every client disconnects (`should_start_server`), so caching here
-/// adds no staleness the process does not already have.
+/// The process-wide answer shared with the rest of RustDesk (hbb_common's `is_x11_or_headless_cached`,
+/// which rustdesk's `IS_X11` also uses). Uncached, every call ran `loginctl` three times (list-sessions
+/// twice, show-session Type), and display_service polls `Display::all()` -- which asks this --
+/// every 300 ms: ~790 process launches a minute measured while a client was connected (four each before
+/// is_active moved to sd-login). The rest of the process
+/// already treated the answer as fixed for its lifetime; sharing the one cache keeps scrap from ever
+/// disagreeing with it.
 #[cfg(x11)]
 #[inline]
 pub fn is_x11() -> bool {
-    static IS_X11: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *IS_X11.get_or_init(hbb_common::platform::linux::is_x11_or_headless)
+    hbb_common::platform::linux::is_x11_or_headless_cached()
 }
 
 #[cfg(all(test, x11))]
 mod is_x11_cache_tests {
-    /// is_x11() must not re-evaluate the display server once it has an answer (each evaluation is four
-    /// `loginctl` launches). RUSTDESK_FORCED_DISPLAY_SERVER short-circuits the lookup, so flipping it after
-    /// the first call shows whether a second call looks again. Robust to another test having filled the
-    /// cache first: the flip is always to the opposite of whatever the first call returned.
+    /// scrap must answer from the SAME cache as the rest of the process, not look again and not keep its
+    /// own. Fill the shared cache, flip RUSTDESK_FORCED_DISPLAY_SERVER (which short-circuits a lookup) to
+    /// the opposite answer, and scrap must still agree: an uncached or separately-cached is_x11() would
+    /// look up the flipped value. Robust to the cache having been filled earlier.
     #[test]
-    fn is_x11_is_computed_once() {
+    fn is_x11_uses_the_shared_process_cache() {
         std::env::set_var("RUSTDESK_FORCED_DISPLAY_SERVER", "x11");
-        let first = super::is_x11();
+        let shared = hbb_common::platform::linux::is_x11_or_headless_cached();
         std::env::set_var(
             "RUSTDESK_FORCED_DISPLAY_SERVER",
-            if first { "wayland" } else { "x11" },
+            if shared { "wayland" } else { "x11" },
         );
-        let second = super::is_x11();
+        let scrap = super::is_x11();
         std::env::remove_var("RUSTDESK_FORCED_DISPLAY_SERVER");
-        assert_eq!(second, first, "is_x11() looked up the display server again");
+        assert_eq!(scrap, shared, "scrap::is_x11() did not answer from the shared cache");
     }
 }
 
