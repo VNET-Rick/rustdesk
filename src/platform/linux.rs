@@ -2410,9 +2410,10 @@ mod proc_scan_tests {
         let me = std::fs::read(format!("/proc/{}/comm", std::process::id())).unwrap();
         let me = me.strip_suffix(b"\n").unwrap_or(&me).to_vec();
         assert!(any_process_matches("comm", |raw| comm_contains(raw, &me)));
-        assert!(!any_process_matches("comm", |raw| comm_contains(
-            raw,
-            b"no-such-process-name-7f3a"
-        )));
+        // The needle must fit in a comm (<= 15 bytes), or this could never match and the
+        // negative check would pass vacuously.
+        let absent: &[u8] = b"nosuchproc7f3a";
+        assert!(absent.len() <= 15);
+        assert!(!any_process_matches("comm", |raw| comm_contains(raw, absent)));
     }
 }
