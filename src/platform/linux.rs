@@ -917,21 +917,60 @@ pub fn get_active_userid_fresh() -> String {
     get_values_of_seat0(&[1])[0].clone()
 }
 
-fn get_cm() -> bool {
-    // We use `CMD_PS` instead of `ps` to suppress some audit messages on some systems.
-    if let Ok(output) = Command::new(CMD_PS.as_str()).args(vec!["aux"]).output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.contains(&format!(
-                "{} --cm",
-                std::env::current_exe()
-                    .unwrap_or("".into())
-                    .to_string_lossy()
-            )) {
+/// Returns true if any live process's `/proc/<pid>/<file>` satisfies `pred`.
+///
+/// Reads procfs directly instead of spawning `ps` / `pgrep`. The service loop in
+/// `start_os_service` polls every 500 ms while the session is unchanged, and it used to
+/// spawn `ps aux` (via `get_cm`) and `sh -c "pgrep -a Xwayland"` (via
+/// `is_xwayland_running`) on every pass. Each spawn walks the whole process table, which
+/// made the idle service one of the busiest processes on the machine (#16312, #15520,
+/// #11156, #8695, #6038). Reading procfs in-process gives the same answer without the
+/// fork/exec or the per-process parsing `ps` does.
+fn any_process_matches(file: &str, pred: impl Fn(&[u8]) -> bool) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let is_pid = name
+            .to_str()
+            .map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or(false);
+        if !is_pid {
+            continue;
+        }
+        // Processes can exit between read_dir and read; that is not an error.
+        if let Ok(buf) = std::fs::read(entry.path().join(file)) {
+            if pred(&buf) {
                 return true;
             }
         }
     }
     false
+}
+
+/// `/proc/<pid>/cmdline` is NUL-separated argv; `ps aux` printed it space-separated.
+/// Normalise it the same way so matching behaves exactly as it did with `ps aux`.
+fn cmdline_as_ps_line(raw: &[u8]) -> String {
+    let joined: Vec<u8> = raw
+        .strip_suffix(b"\0")
+        .unwrap_or(raw)
+        .iter()
+        .map(|&b| if b == 0 { b' ' } else { b })
+        .collect();
+    String::from_utf8_lossy(&joined).into_owned()
+}
+
+fn get_cm() -> bool {
+    let pattern = format!(
+        "{} --cm",
+        std::env::current_exe()
+            .unwrap_or("".into())
+            .to_string_lossy()
+    );
+    any_process_matches("cmdline", |raw| {
+        cmdline_as_ps_line(raw).contains(&pattern)
+    })
 }
 
 pub fn is_login_wayland() -> bool {
@@ -1598,10 +1637,14 @@ pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> Re
 
 #[inline]
 pub fn is_xwayland_running() -> bool {
-    if let Ok(output) = run_cmds("pgrep -a Xwayland") {
-        return output.contains("Xwayland");
-    }
-    false
+    // Was `pgrep -a Xwayland`, which matches the process name; that name is
+    // `/proc/<pid>/comm`. Substring match, like pgrep's pattern match.
+    any_process_matches("comm", |raw| comm_contains(raw, b"Xwayland"))
+}
+
+fn comm_contains(raw: &[u8], needle: &[u8]) -> bool {
+    let comm = raw.strip_suffix(b"\n").unwrap_or(raw);
+    !needle.is_empty() && comm.windows(needle.len()).any(|w| w == needle)
 }
 
 mod desktop {
@@ -2326,5 +2369,50 @@ pub fn has_gnome_shortcuts_inhibitor_permission() -> bool {
             log::debug!("Failed to query shortcuts inhibitor permission: {}", e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod proc_scan_tests {
+    use super::*;
+
+    #[test]
+    fn cmdline_is_joined_like_ps_aux() {
+        assert_eq!(
+            cmdline_as_ps_line(b"/usr/share/rustdesk/rustdesk\0--cm\0"),
+            "/usr/share/rustdesk/rustdesk --cm"
+        );
+        assert_eq!(cmdline_as_ps_line(b"sleep\x0030"), "sleep 30");
+        assert_eq!(cmdline_as_ps_line(b""), "");
+    }
+
+    #[test]
+    fn get_cm_pattern_still_matches_cm_variants() {
+        // `ps aux` + `contains("<exe> --cm")` also matched `--cm-no-ui`; keep that.
+        let pattern = "/usr/share/rustdesk/rustdesk --cm";
+        assert!(cmdline_as_ps_line(b"/usr/share/rustdesk/rustdesk\0--cm\0").contains(pattern));
+        assert!(cmdline_as_ps_line(b"/usr/share/rustdesk/rustdesk\0--cm-no-ui\0").contains(pattern));
+        assert!(!cmdline_as_ps_line(b"/usr/share/rustdesk/rustdesk\0--server\0").contains(pattern));
+        assert!(!cmdline_as_ps_line(b"/usr/bin/other\0--cm\0").contains(pattern));
+    }
+
+    #[test]
+    fn comm_matching() {
+        assert!(comm_contains(b"Xwayland\n", b"Xwayland"));
+        assert!(comm_contains(b"Xwayland", b"Xwayland"));
+        assert!(!comm_contains(b"Xorg\n", b"Xwayland"));
+        assert!(!comm_contains(b"Xway\n", b"Xwayland"));
+        assert!(!comm_contains(b"Xwayland\n", b""));
+    }
+
+    #[test]
+    fn scan_finds_this_process_and_not_a_fake_one() {
+        let me = std::fs::read(format!("/proc/{}/comm", std::process::id())).unwrap();
+        let me = me.strip_suffix(b"\n").unwrap_or(&me).to_vec();
+        assert!(any_process_matches("comm", |raw| comm_contains(raw, &me)));
+        assert!(!any_process_matches("comm", |raw| comm_contains(
+            raw,
+            b"no-such-process-name-7f3a"
+        )));
     }
 }
