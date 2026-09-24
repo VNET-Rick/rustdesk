@@ -2405,6 +2405,44 @@ mod proc_scan_tests {
         assert!(!comm_contains(b"Xwayland\n", b""));
     }
 
+    /// Runs `f` while a throwaway child process exists, and always reaps the child.
+    fn with_child<T>(mut cmd: std::process::Command, f: impl FnOnce() -> T) -> T {
+        let mut child = cmd.spawn().expect("spawn test child");
+        // Give exec a moment so /proc shows the final cmdline/comm.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let out = f();
+        let _ = child.kill();
+        let _ = child.wait();
+        out
+    }
+
+    #[test]
+    fn get_cm_sees_a_cm_process_and_only_while_it_runs() {
+        // A process whose command line reads "<current_exe> --cm ..." is what `ps aux` showed for the
+        // connection manager. bash's `exec -a` sets argv[0] to that string without being that binary.
+        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        assert!(!get_cm(), "no --cm process should exist before the test starts one");
+        let mut cmd = std::process::Command::new("bash");
+        cmd.args(["-c", r#"exec -a "$0 --cm" sleep 30"#, &exe]);
+        assert!(with_child(cmd, get_cm), "get_cm() must see '<exe> --cm'");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!get_cm(), "get_cm() must go false once the --cm process is gone");
+    }
+
+    #[test]
+    fn is_xwayland_running_finds_a_process_named_xwayland() {
+        // comm is the executable's file name, so run a copy of `sleep` called Xwayland.
+        let dir = std::env::temp_dir().join(format!("rd-xwl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("Xwayland");
+        std::fs::copy("/bin/sleep", &fake).unwrap();
+        let mut cmd = std::process::Command::new(&fake);
+        cmd.arg("30");
+        let seen = with_child(cmd, is_xwayland_running);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen, "is_xwayland_running() must find a process whose comm is Xwayland");
+    }
+
     #[test]
     fn scan_finds_this_process_and_not_a_fake_one() {
         let me = std::fs::read(format!("/proc/{}/comm", std::process::id())).unwrap();
