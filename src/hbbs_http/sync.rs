@@ -122,12 +122,22 @@ async fn start_hbbs_sync_async() {
                 // so it may be able to get the username before login.
                 // But strangely, sometimes we can get the username before login,
                 // we may not be able to get the username before login after the next restart.
-                let mut v = crate::get_sysinfo();
-                let sys_username = v["username"].as_str().unwrap_or_default().to_string();
-                // Though the username comparison is only necessary on Windows,
-                // we still keep the comparison on other platforms for consistency.
-                let need_upload = (!info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username)) &&
-                    info_uploaded.last_uploaded.map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT).unwrap_or(true);
+                //
+                // Collect sysinfo only when an upload is due: need_upload is false whenever the time gate is
+                // closed, and get_sysinfo() is not free -- on Linux it runs `loginctl` to find the username.
+                // With an API server that does not answer (e.g. a derived http://127.0.0.1:21114), the gate
+                // stays closed for UPLOAD_SYSINFO_TIMEOUT after each failed upload, so this was a process
+                // launch every 3 s for nothing.
+                let (mut v, sys_username, need_upload) = if upload_due(info_uploaded.last_uploaded) {
+                    let v = crate::get_sysinfo();
+                    let sys_username = v["username"].as_str().unwrap_or_default().to_string();
+                    // Though the username comparison is only necessary on Windows,
+                    // we still keep the comparison on other platforms for consistency.
+                    let need = !info_uploaded.uploaded || info_uploaded.username.as_ref() != Some(&sys_username);
+                    (v, sys_username, need)
+                } else {
+                    (Value::Null, String::new(), false)
+                };
                 if need_upload {
                     v["version"] = json!(crate::VERSION);
                     v["id"] = json!(id);
@@ -273,6 +283,14 @@ async fn start_hbbs_sync_async() {
     }
 }
 
+/// The sysinfo upload time gate: never uploaded yet (or reset), or the last attempt is old enough.
+#[cfg(not(any(target_os = "ios")))]
+fn upload_due(last_uploaded: Option<Instant>) -> bool {
+    last_uploaded
+        .map(|x| x.elapsed() >= UPLOAD_SYSINFO_TIMEOUT)
+        .unwrap_or(true)
+}
+
 fn heartbeat_url() -> String {
     let url = crate::common::get_api_server(
         Config::get_option("api-server"),
@@ -307,4 +325,19 @@ fn handle_config_options(config_options: HashMap<String, String>) {
 #[cfg(not(any(target_os = "ios")))]
 pub fn is_pro() -> bool {
     PRO.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+mod upload_due_tests {
+    use super::*;
+
+    #[test]
+    fn upload_gate() {
+        assert!(upload_due(None), "never uploaded: due");
+        assert!(!upload_due(Some(Instant::now())), "just attempted: not due");
+        let old = Instant::now()
+            .checked_sub(UPLOAD_SYSINFO_TIMEOUT + Duration::from_secs(1))
+            .expect("monotonic clock older than the timeout");
+        assert!(upload_due(Some(old)), "attempted longer ago than the timeout: due");
+    }
 }
