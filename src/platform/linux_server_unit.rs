@@ -19,6 +19,8 @@
 //!   `*`, or @group), plus the open-files limit the sudo-started server had (1048576). Everything else
 //!   is systemd's default for system units, the same defaults rustdesk.service itself runs with.
 //! * umask 022 (pam_umask); supplementary groups via `User=`; cwd `/`, stdin null, output to the journal.
+//! * logs: the server's output is in the journal under its own unit, not rustdesk.service:
+//!   `journalctl -u 'rustdesk-server-*'` (units are collected when they stop, the journal stays).
 //! * `PAMName=` is deliberately NOT set: it would open a logind session and move the processes into a
 //!   session scope, outside the unit's cgroup. sudo's PAM stack on Ubuntu 24.04
 //!   (common-session-noninteractive) has no pam_systemd, so today's server has no session either.
@@ -84,8 +86,26 @@ thread_local! {
     static BUS: RefCell<Option<Connection>> = RefCell::new(None);
 }
 
+/// Errors that say nothing about the connection itself (the connection is kept).
 fn is_benign(e: &dbus::Error) -> bool {
-    matches!(e.name(), Some(NO_SUCH_UNIT) | Some(UNKNOWN_OBJECT))
+    !is_connection_error(e)
+}
+
+/// Errors after which the cached connection may be dead and is replaced on the next call.
+fn is_connection_error(e: &dbus::Error) -> bool {
+    match e.name() {
+        None => true,
+        Some(n) => matches!(
+            n,
+            "org.freedesktop.DBus.Error.Disconnected"
+                | "org.freedesktop.DBus.Error.NoReply"
+                | "org.freedesktop.DBus.Error.Timeout"
+                | "org.freedesktop.DBus.Error.TimedOut"
+                | "org.freedesktop.DBus.Error.NoServer"
+                | "org.freedesktop.DBus.Error.IOError"
+                | "org.freedesktop.DBus.Error.ServiceUnknown"
+        ),
+    }
 }
 
 /// Run `f` against a proxy for `path` with `timeout`. Any error other than "no such unit/object"
@@ -402,6 +422,9 @@ impl ServerUnit {
             ("User".into(), v(uid.to_string())),
             ("Environment".into(), v(environment)),
             ("UMask".into(), v(0o022u32)),
+            // HOME, SHELL, LOGNAME from the passwd entry (systemd >= 255; sudo gave the server SHELL and
+            // terminal_service.rs uses it). Environment= still wins for HOME when the desktop has one.
+            ("SetLoginEnvironment".into(), v(true)),
             ("KillMode".into(), v("control-group".to_owned())),
             ("TimeoutStopUSec".into(), v(STOP_TIMEOUT_USEC)),
             // Gone as soon as it stops or fails: no "failed" leftovers; names are never reused anyway.
@@ -729,6 +752,9 @@ mod tests {
             .find(|l| l.starts_with("Max open files"))
             .unwrap();
         assert!(nofile.contains("1048576"), "{nofile}");
+        // nobody's login shell and name, from SetLoginEnvironment.
+        assert!(env.iter().any(|e| e.starts_with("SHELL=/")), "{env:?}");
+        assert!(env.contains(&"LOGNAME=nobody".to_owned()), "{env:?}");
     }
 
     #[test]
