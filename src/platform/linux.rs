@@ -680,6 +680,11 @@ fn start_user_server(
                     "server units keep failing right after start; DEGRADED: starting uid {} via sudo",
                     desktop.uid
                 ),
+                StartError::Retry(e) => {
+                    // Nothing was sent; the loop tries again on its next tick.
+                    log::warn!("server unit for uid {} not started yet: {e}", desktop.uid);
+                    return Ok(None);
+                }
             }
             Ok(run_as_user(
                 vec!["--server"],
@@ -901,6 +906,7 @@ pub fn start_os_service() {
             sleep_millis(500);
             continue;
         }
+        super::linux_server_unit::reap_unconfirmed();
         desktop.refresh();
         update_active_user_lookup_cache(&desktop);
 

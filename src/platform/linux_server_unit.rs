@@ -53,9 +53,9 @@ const STOP_CALL: Duration = Duration::from_secs(1);
 const PROBE_CALL: Duration = Duration::from_millis(250);
 /// TimeoutStopSec of the unit; systemd SIGKILLs the cgroup after it.
 const STOP_TIMEOUT_USEC: u64 = 2_000_000;
-/// Total budget of one `stop()`, every D-Bus call included (StopUnit, polling, KillUnit, polling).
-/// Not included: (re)connecting to the system bus, a local unix-socket connect + auth that the dbus
-/// crate offers no timeout for; it happens at most once per call and only after a disconnect.
+/// Budget of one `stop()`: every D-Bus method call in it is bounded by what is left of this. Not
+/// bounded: (re)connecting to the system bus (a local unix-socket connect + auth; the dbus crate has
+/// no connect timeout). A reconnect only happens after the connection dropped, before the next call.
 const STOP_DEADLINE: Duration = Duration::from_millis(4_000);
 /// A unit whose start reply was lost is not treated as gone before this: until then a "no such unit"
 /// may just mean systemd has not processed the start yet.
@@ -405,10 +405,11 @@ pub fn pam_limits_for(
 /// DefaultLimitX{Soft,} for system units -- what the sudo-started server inherited from
 /// rustdesk.service. NOFILE's unnamed sides default to what the sudo-started server had. Soft is
 /// clamped to hard.
+/// Fails (nothing is guessed) when an unnamed side's default cannot be read.
 pub fn limit_props_from(
     limits: Vec<(&'static str, Option<u64>, Option<u64>)>,
     default: impl Fn(&str) -> Option<(u64, u64)>,
-) -> Vec<(String, u64)> {
+) -> Result<Vec<(String, u64)>, String> {
     let mut limits = limits;
     if !limits.iter().any(|(p, _, _)| *p == "LimitNOFILE") {
         limits.push(("LimitNOFILE", None, None));
@@ -417,16 +418,10 @@ pub fn limit_props_from(
     for (prop, soft, hard) in limits {
         let (def_soft, def_hard) = if prop == "LimitNOFILE" {
             (SUDO_NOFILE, SUDO_NOFILE)
+        } else if let (Some(s), Some(h)) = (soft, hard) {
+            (s, h) // both named: no default needed
         } else {
-            match default(prop) {
-                Some(d) => d,
-                // Default unknown: set only the named side(s) as a pair rather than guess.
-                None => match (soft, hard) {
-                    (Some(s), None) => (s, u64::MAX),
-                    (None, Some(h)) => (h, h),
-                    _ => (0, u64::MAX),
-                },
-            }
+            default(prop).ok_or_else(|| format!("cannot read systemd's Default{prop}"))?
         };
         // pam_limits cannot raise a soft limit above the hard one either (setrlimit fails), so a soft
         // value above the inherited hard limit is clamped, not turned into a higher hard limit.
@@ -435,18 +430,27 @@ pub fn limit_props_from(
         props.push((prop.to_owned(), hard));
         props.push((format!("{prop}Soft"), soft));
     }
-    props
+    Ok(props)
 }
 
-/// systemd's DefaultLimitX (hard) and DefaultLimitXSoft for `prop` ("LimitCORE" -> DefaultLimitCORE).
+/// systemd's DefaultLimitX{Soft,} for `prop` ("LimitCORE" -> DefaultLimitCORE) as (soft, hard).
+/// Successful reads are cached (they only change on a daemon-reexec); failures are not.
 fn manager_default_limit(prop: &str) -> Option<(u64, u64)> {
-    with_manager(PROBE_CALL, |m| {
+    thread_local! {
+        static CACHE: RefCell<Vec<(String, (u64, u64))>> = RefCell::new(Vec::new());
+    }
+    if let Some(v) = CACHE.with(|c| c.borrow().iter().find(|(p, _)| p == prop).map(|x| x.1)) {
+        return Some(v);
+    }
+    let v = with_manager(PROBE_CALL, |m| {
         use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
         let hard: u64 = m.get(MANAGER, &format!("Default{prop}"))?;
         let soft: u64 = m.get(MANAGER, &format!("Default{prop}Soft"))?;
         Ok((soft, hard))
     })
-    .ok()
+    .ok()?;
+    CACHE.with(|c| c.borrow_mut().push((prop.to_owned(), v)));
+    Some(v)
 }
 
 fn read_limits_sources() -> Vec<String> {
@@ -470,7 +474,7 @@ fn read_limits_sources() -> Vec<String> {
 }
 
 /// systemd `Limit*` properties for `uid`: pam_limits parity plus the sudo open-files limit.
-fn limit_properties(uid: u32) -> Vec<(String, u64)> {
+fn limit_properties(uid: u32) -> Result<Vec<(String, u64)>, String> {
     use hbb_common::users::{get_user_by_uid, get_user_groups};
     let (name, groups) = match get_user_by_uid(uid) {
         Some(u) => {
@@ -511,6 +515,39 @@ pub enum StartError {
     NotCreated(hbb_common::anyhow::Error),
     /// Too many units failed right after starting: the caller should fall back.
     Degraded,
+    /// Nothing was sent (e.g. the limits could not be computed): try again later, do not fall back.
+    Retry(String),
+}
+
+/// Units whose start was never confirmed and that were then treated as gone (lost start reply, then
+/// no such unit for START_SETTLE, or stopped while unconfirmed). systemd may still execute such a
+/// start later; `reap_unconfirmed()` checks these names every loop tick and stops any that appears.
+static UNCONFIRMED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const UNCONFIRMED_CAP: usize = 64;
+
+fn watch_unconfirmed(name: &str) {
+    let mut w = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.iter().any(|n| n == name) {
+        if w.len() >= UNCONFIRMED_CAP {
+            w.remove(0);
+        }
+        log::warn!("{name}: start never confirmed; watching for it");
+        w.push(name.to_owned());
+    }
+}
+
+/// Stop any watched unconfirmed unit that has come up after all. Cheap when the list is empty (the
+/// normal case); one GetUnit per watched name otherwise.
+pub fn reap_unconfirmed() {
+    let names = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for n in names {
+        if let Ok(Some(state)) = active_state(&n, PROBE_CALL) {
+            if state != "inactive" && state != "failed" {
+                log::error!("{n}: a start whose reply was lost came up late ({state}); stopping it");
+                stop_unit_by_name(&n);
+            }
+        }
+    }
 }
 
 impl ServerUnit {
@@ -587,7 +624,11 @@ impl ServerUnit {
             // Older systemd rejects the property (the whole start would fail), so it is only sent here.
             props.push(("SetLoginEnvironment".into(), v(true)));
         }
-        for (prop, val) in limit_properties(uid) {
+        let limits = match limit_properties(uid) {
+            Ok(l) => l,
+            Err(e) => return Err(StartError::Retry(e)),
+        };
+        for (prop, val) in limits {
             props.push((prop, v(val)));
         }
         if let Some(parent) = own_unit() {
@@ -630,8 +671,14 @@ impl ServerUnit {
     pub fn has_exited(&self) -> bool {
         let age = self.started.elapsed();
         let exited = match active_state(&self.name, PROBE_CALL) {
-            // A start whose reply was lost may not be processed yet: not gone before START_SETTLE.
-            Ok(None) => self.confirmed.get() || age >= START_SETTLE,
+            // A start whose reply was lost may not be processed yet: not gone before START_SETTLE,
+            // and after that its name stays watched (reap_unconfirmed) in case it comes up late.
+            Ok(None) if self.confirmed.get() => true,
+            Ok(None) if age >= START_SETTLE => {
+                watch_unconfirmed(&self.name);
+                true
+            }
+            Ok(None) => false,
             Ok(Some(s)) => {
                 self.confirmed.set(true);
                 s == "inactive" || s == "failed"
@@ -659,7 +706,12 @@ impl ServerUnit {
     /// the caller keeps owning it and retries.
     pub fn stop(&self) -> bool {
         self.stopping.set(true);
-        stop_unit_by_name(&self.name)
+        let gone = stop_unit_by_name(&self.name);
+        if gone && !self.confirmed.get() {
+            // "No such unit" for a start whose reply was lost may only mean "not yet".
+            watch_unconfirmed(&self.name);
+        }
+        gone
     }
 }
 
@@ -727,13 +779,13 @@ fn is_down(state: &ResultType<Option<String>>) -> bool {
     matches!(state, Ok(None)) || matches!(state, Ok(Some(s)) if s == "inactive" || s == "failed")
 }
 
-/// Stop one of our units within STOP_DEADLINE (all calls included). True = gone.
+/// Stop one of our units; every method call bounded by STOP_DEADLINE (bus reconnects are not, see there). True = gone.
 fn stop_unit_by_name(name: &str) -> bool {
     if !is_our_unit_name(name) {
         log::error!("refusing to stop '{name}': not a server unit");
         return false;
     }
-    // Every call below is bounded by what is left of this budget.
+    // Every method call below is bounded by what is left of this budget.
     let deadline = Instant::now() + STOP_DEADLINE;
     let kill_phase = deadline - Duration::from_secs(1); // 1 s kept for the SIGKILL path
     let res = with_manager(STOP_CALL.min(remaining(kill_phase)), |m| {
@@ -1221,10 +1273,11 @@ f - rtprio -1
                 ("LimitCORE", Some(0), None),
                 ("LimitSTACK", None, Some(8192)),
                 ("LimitNPROC", Some(900), Some(500)),
-                ("LimitRTPRIO", Some(5), None), // no default known
+                ("LimitRTPRIO", Some(5), Some(7)), // both named: no default needed
             ],
             defaults,
-        );
+        )
+        .unwrap();
         let has = |k: &str, v: u64| props.contains(&(k.to_owned(), v));
         // both sides always sent; the unnamed side is systemd's default
         assert!(
@@ -1241,21 +1294,24 @@ f - rtprio -1
             "{props:?}"
         ); // clamped
         assert!(
-            has("LimitRTPRIOSoft", 5) && has("LimitRTPRIO", u64::MAX),
+            has("LimitRTPRIOSoft", 5) && has("LimitRTPRIO", 7),
             "{props:?}"
         );
         assert!(has("LimitNOFILE", SUDO_NOFILE) && has("LimitNOFILESoft", SUDO_NOFILE));
         assert_eq!(props.len(), 10, "{props:?}"); // 5 limits x 2 sides
-                                                  // a soft-only value above the inherited hard is clamped, never raises hard
-        let p2 = limit_props_from(vec![("LimitNPROC", Some(900), None)], defaults);
+        // a soft-only value above the inherited hard is clamped, never raises hard
+        let p2 = limit_props_from(vec![("LimitNPROC", Some(900), None)], defaults).unwrap();
         assert!(
             p2.contains(&("LimitNPROC".to_owned(), 200))
                 && p2.contains(&("LimitNPROCSoft".to_owned(), 200))
         );
         // a pam soft-only nofile keeps its soft value; the hard side is the sudo value
-        let p3 = limit_props_from(vec![("LimitNOFILE", Some(4096), None)], defaults);
+        let p3 = limit_props_from(vec![("LimitNOFILE", Some(4096), None)], defaults).unwrap();
         assert!(p3.contains(&("LimitNOFILESoft".to_owned(), 4096)));
         assert!(p3.contains(&("LimitNOFILE".to_owned(), SUDO_NOFILE)));
+        // an unnamed side whose default cannot be read is an error, never a guess
+        assert!(limit_props_from(vec![("LimitRTPRIO", Some(5), None)], defaults).is_err());
+        assert!(limit_props_from(vec![("LimitRTPRIO", None, Some(5))], |_| None).is_err());
     }
 
     /// Root + systemd: a soft-only and a hard-only pam line reach the unit's process with the other
@@ -1273,7 +1329,7 @@ f - rtprio -1
         let path = "/etc/security/limits.d/99-vnet-rd-unit-test.conf";
         std::fs::write(path, "nobody soft core 0\nnobody hard nproc 4242\n").unwrap();
         let _cleanup = Cleanup(path);
-        let (core_soft_def, core_hard_def) = manager_default_limit("LimitCORE").unwrap();
+        let (_, core_hard_def) = manager_default_limit("LimitCORE").unwrap();
         let (nproc_soft_def, _) = manager_default_limit("LimitNPROC").unwrap();
         let unit = ServerUnit::start(
             "65534",
@@ -1305,7 +1361,6 @@ f - rtprio -1
                 v.to_string()
             }
         };
-        let _ = core_soft_def;
         assert_eq!(
             fields("Max core file size"),
             ("0".to_owned(), show(core_hard_def)),
