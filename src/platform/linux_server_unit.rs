@@ -57,7 +57,13 @@ const STOP_DEADLINE: Duration = Duration::from_millis(4_000);
 /// (/usr/local/sbin/xrandr, Boost desktop/display/xrandr-rustdesk) relies on /usr/local/sbin first.
 const SERVER_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// Copied from the service's own environment (sudo -E passed all of it; these are what the server uses).
-const INHERITED_ENV: &[&str] = &["LANG", "LANGUAGE", "PULSE_LATENCY_MSEC", "PIPEWIRE_LATENCY", "RUST_LOG"];
+const INHERITED_ENV: &[&str] = &[
+    "LANG",
+    "LANGUAGE",
+    "PULSE_LATENCY_MSEC",
+    "PIPEWIRE_LATENCY",
+    "RUST_LOG",
+];
 /// Open-files limit the sudo-started server had on boostlap (soft = hard = 1048576).
 const SUDO_NOFILE: u64 = 1_048_576;
 /// A unit that exits this soon after starting counts as a failed start.
@@ -233,7 +239,9 @@ pub fn pam_limits_for(
             let (domain, kind, item, value) = (f[0], f[1], f[2], f[3]);
             let applies = domain == user
                 || domain == "*"
-                || domain.strip_prefix('@').map_or(false, |g| groups.iter().any(|x| x == g));
+                || domain
+                    .strip_prefix('@')
+                    .map_or(false, |g| groups.iter().any(|x| x == g));
             if !applies {
                 continue;
             }
@@ -249,9 +257,13 @@ pub fn pam_limits_for(
                     _ => continue,
                 }
             } else {
-                let Ok(n) = value.parse::<u64>() else { continue };
+                let Ok(n) = value.parse::<u64>() else {
+                    continue;
+                };
                 match item {
-                    "memlock" | "core" | "stack" | "as" | "fsize" | "data" => n.saturating_mul(1024),
+                    "memlock" | "core" | "stack" | "as" | "fsize" | "data" => {
+                        n.saturating_mul(1024)
+                    }
                     "cpu" => n.saturating_mul(60),
                     _ => n,
                 }
@@ -368,7 +380,9 @@ impl ServerUnit {
         }
         let not_created = |e: hbb_common::anyhow::Error| Err(StartError::NotCreated(e));
         let Some(uid) = parse_uid(uid) else {
-            return not_created(hbb_common::anyhow::anyhow!("refusing a server unit for uid '{uid}'"));
+            return not_created(hbb_common::anyhow::anyhow!(
+                "refusing a server unit for uid '{uid}'"
+            ));
         };
         let Some(exe_s) = exe.to_str() else {
             return not_created(hbb_common::anyhow::anyhow!("non-UTF-8 executable path"));
@@ -380,7 +394,10 @@ impl ServerUnit {
         let environment = build_environment(uid, envs, &inherited);
 
         let mut props: Vec<(String, Variant<Box<dyn RefArg>>)> = vec![
-            ("Description".into(), v(format!("RustDesk server for uid {uid}"))),
+            (
+                "Description".into(),
+                v(format!("RustDesk server for uid {uid}")),
+            ),
             ("ExecStart".into(), v(vec![(exe_s.to_owned(), argv, false)])),
             ("User".into(), v(uid.to_string())),
             ("Environment".into(), v(environment)),
@@ -400,8 +417,11 @@ impl ServerUnit {
         }
         let aux: Vec<(String, Vec<(String, Variant<Box<dyn RefArg>>)>)> = vec![];
         let res = with_manager(START_CALL, |m| {
-            let (_job,): (DbusPath,) =
-                m.method_call(MANAGER, "StartTransientUnit", (name.as_str(), "fail", props, aux))?;
+            let (_job,): (DbusPath,) = m.method_call(
+                MANAGER,
+                "StartTransientUnit",
+                (name.as_str(), "fail", props, aux),
+            )?;
             Ok(())
         });
         let unit = ServerUnit {
@@ -417,11 +437,17 @@ impl ServerUnit {
             Err(e) => match active_state(&unit.name) {
                 Ok(None) => not_created(e),
                 Ok(Some(state)) => {
-                    log::warn!("{}: start reported '{e}' but the unit exists ({state}); tracking it", unit.name);
+                    log::warn!(
+                        "{}: start reported '{e}' but the unit exists ({state}); tracking it",
+                        unit.name
+                    );
                     Ok(unit)
                 }
                 Err(probe) => {
-                    log::warn!("{}: start outcome unknown ('{e}', then '{probe}'); tracking it", unit.name);
+                    log::warn!(
+                        "{}: start outcome unknown ('{e}', then '{probe}'); tracking it",
+                        unit.name
+                    );
                     Ok(unit)
                 }
             },
@@ -443,7 +469,11 @@ impl ServerUnit {
         if exited && !self.stopping.get() {
             if self.started.elapsed() < FAST_FAIL_WINDOW {
                 let n = FAST_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
-                log::error!("{} exited {:?} after starting ({n} in a row)", self.name, self.started.elapsed());
+                log::error!(
+                    "{} exited {:?} after starting ({n} in a row)",
+                    self.name,
+                    self.started.elapsed()
+                );
             } else {
                 FAST_FAILS.store(0, Ordering::Relaxed);
             }
@@ -507,9 +537,10 @@ fn stop_unit_by_name(name: &str) -> bool {
     // systemd SIGKILLs the cgroup after TimeoutStopSec on its own; this covers a stop job that
     // never ran (e.g. StopUnit itself failed).
     log::error!("{name}: still up; sending SIGKILL to the whole unit");
-    let _ = with_manager(STOP_CALL.min(deadline.saturating_duration_since(Instant::now())), |m| {
-        m.method_call::<(), _, _, _>(MANAGER, "KillUnit", (name, "all", 9i32))
-    });
+    let _ = with_manager(
+        STOP_CALL.min(deadline.saturating_duration_since(Instant::now())),
+        |m| m.method_call::<(), _, _, _>(MANAGER, "KillUnit", (name, "all", 9i32)),
+    );
     if wait_down(name, deadline) {
         return true;
     }
@@ -539,13 +570,24 @@ fn wait_down(name: &str, deadline: Instant) -> bool {
 pub fn sweep() {
     let listed = with_manager(START_CALL, |m| {
         type Row = (
-            String, String, String, String, String, String, DbusPath<'static>, u32, String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            DbusPath<'static>,
+            u32,
+            String,
             DbusPath<'static>,
         );
         let (rows,): (Vec<Row>,) = m.method_call(
             MANAGER,
             "ListUnitsByPatterns",
-            (Vec::<String>::new(), vec![format!("{UNIT_PREFIX}*.service")]),
+            (
+                Vec::<String>::new(),
+                vec![format!("{UNIT_PREFIX}*.service")],
+            ),
         )?;
         Ok(rows.into_iter().map(|r| r.0).collect::<Vec<String>>())
     });
@@ -586,7 +628,18 @@ mod tests {
     fn uids_are_parsed_strictly() {
         assert_eq!(parse_uid("1000"), Some(1000));
         assert_eq!(parse_uid("115"), Some(115));
-        for bad in ["", "0", "00", "-1", "4294967295", "4294967296", "1e3", " 1000", "1000\n", "root"] {
+        for bad in [
+            "",
+            "0",
+            "00",
+            "-1",
+            "4294967295",
+            "4294967296",
+            "1e3",
+            " 1000",
+            "1000\n",
+            "root",
+        ] {
             assert_eq!(parse_uid(bad), None, "{bad:?}");
         }
     }
@@ -616,7 +669,10 @@ mod tests {
                 .collect()
         };
         let before = pids(unit.name());
-        assert!(before.len() >= 3, "expected the tree in the unit's cgroup, got {before:?}");
+        assert!(
+            before.len() >= 3,
+            "expected the tree in the unit's cgroup, got {before:?}"
+        );
         assert!(!unit.has_exited());
         assert!(unit.stop());
         assert!(unit.has_exited());
@@ -640,12 +696,21 @@ mod tests {
             "65534",
             Path::new("/bin/sh"),
             &["-c", "exec sleep 300"],
-            &[("DISPLAY".to_owned(), ":7".to_owned()), ("PATH".to_owned(), "/tmp/evil".to_owned())],
+            &[
+                ("DISPLAY".to_owned(), ":7".to_owned()),
+                ("PATH".to_owned(), "/tmp/evil".to_owned()),
+            ],
         )
         .unwrap_or_else(|_| panic!("start"));
         std::thread::sleep(Duration::from_millis(500));
         let cg = format!("/sys/fs/cgroup/system.slice/{}/cgroup.procs", unit.name());
-        let pid: u32 = std::fs::read_to_string(cg).unwrap().lines().next().unwrap().parse().unwrap();
+        let pid: u32 = std::fs::read_to_string(cg)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
         let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
         let env: Vec<String> = env
             .split(|b| *b == 0)
@@ -655,8 +720,14 @@ mod tests {
         assert!(unit.stop());
         assert!(env.contains(&"DISPLAY=:7".to_owned()), "{env:?}");
         assert!(env.contains(&format!("PATH={SERVER_PATH}")), "{env:?}");
-        assert!(env.contains(&"XDG_RUNTIME_DIR=/run/user/65534".to_owned()), "{env:?}");
-        let nofile = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
+        assert!(
+            env.contains(&"XDG_RUNTIME_DIR=/run/user/65534".to_owned()),
+            "{env:?}"
+        );
+        let nofile = limits
+            .lines()
+            .find(|l| l.starts_with("Max open files"))
+            .unwrap();
         assert!(nofile.contains("1048576"), "{nofile}");
     }
 
@@ -666,7 +737,10 @@ mod tests {
             own_unit_from_cgroup("0::/system.slice/rustdesk.service\n").as_deref(),
             Some("rustdesk.service")
         );
-        assert_eq!(own_unit_from_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n"), None);
+        assert_eq!(
+            own_unit_from_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n"),
+            None
+        );
         assert_eq!(own_unit_from_cgroup("0::/\n"), None);
         assert_eq!(own_unit_from_cgroup("1:name=systemd:/x.service\n"), None);
     }
@@ -700,7 +774,9 @@ mod tests {
         assert!(env.contains(&"PIPEWIRE_LATENCY=1024/48000".to_owned()));
         assert!(env.contains(&"LANG=en_US.UTF-8".to_owned()));
         assert!(env.contains(&"LC_TIME=en_GB.UTF-8".to_owned()));
-        assert!(!env.iter().any(|e| e.starts_with("LD_PRELOAD") || e.starts_with("INVOCATION_ID")));
+        assert!(!env
+            .iter()
+            .any(|e| e.starts_with("LD_PRELOAD") || e.starts_with("INVOCATION_ID")));
     }
 
     #[test]
@@ -724,13 +800,21 @@ alice       soft nofile 2048   # trailing comment
             pam_limits_for(&[conf.clone(), later.clone()], user, &g)
         };
         let alice = get("alice", &[]);
-        assert!(alice.contains(&("LimitNOFILE", Some(3000), Some(4096))), "{alice:?}");
+        assert!(
+            alice.contains(&("LimitNOFILE", Some(3000), Some(4096))),
+            "{alice:?}"
+        );
         assert!(alice.contains(&("LimitCORE", Some(0), None)), "{alice:?}");
-        assert!(!alice.iter().any(|(p, _, _)| *p == "LimitRTPRIO" || *p == "LimitNPROC"));
+        assert!(!alice
+            .iter()
+            .any(|(p, _, _)| *p == "LimitRTPRIO" || *p == "LimitNPROC"));
         let pw = get("carol", &["pipewire"]);
         assert!(pw.contains(&("LimitRTPRIO", Some(95), Some(95))), "{pw:?}");
         assert!(pw.contains(&("LimitNICE", Some(39), Some(39))), "{pw:?}");
-        assert!(pw.contains(&("LimitMEMLOCK", Some(4194304 * 1024), Some(4194304 * 1024))), "{pw:?}");
+        assert!(
+            pw.contains(&("LimitMEMLOCK", Some(4194304 * 1024), Some(4194304 * 1024))),
+            "{pw:?}"
+        );
         assert!(!get("bob", &[]).iter().any(|(p, _, _)| *p == "LimitRTPRIO"));
     }
 }

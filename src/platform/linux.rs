@@ -664,8 +664,10 @@ fn start_user_server(
 ) -> ResultType<Option<ServerProcess>> {
     use super::linux_server_unit::{ServerUnit, StartError};
     let exe = std::env::current_exe()?;
-    let owned: Vec<(String, String)> =
-        envs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let owned: Vec<(String, String)> = envs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
     match ServerUnit::start(&desktop.uid, &exe, &["--server"], &owned) {
         Ok(unit) => Ok(Some(ServerProcess::Unit(unit))),
         Err(e) => {
@@ -908,14 +910,15 @@ pub fn start_os_service() {
             // No need to check is_display_changed here.
             if !blocked
                 && should_start_server(
-                true,
-                false,
-                &mut uid,
-                &desktop,
-                &mut cm0,
-                &mut last_restart,
-                &mut server,
-            ) {
+                    true,
+                    false,
+                    &mut uid,
+                    &desktop,
+                    &mut cm0,
+                    &mut last_restart,
+                    &mut server,
+                )
+            {
                 stop_subprocess();
                 force_stop_server();
                 start_server(None, &mut server);
@@ -934,14 +937,15 @@ pub fn start_os_service() {
             // try start subprocess "--server"
             if !blocked
                 && should_start_server(
-                !desktop.is_wayland(),
-                is_display_changed,
-                &mut uid,
-                &desktop,
-                &mut cm0,
-                &mut last_restart,
-                &mut user_server,
-            ) {
+                    !desktop.is_wayland(),
+                    is_display_changed,
+                    &mut uid,
+                    &desktop,
+                    &mut cm0,
+                    &mut last_restart,
+                    &mut user_server,
+                )
+            {
                 stop_subprocess();
                 // VNET: the name-based ps sweep only when the previous user server was started via sudo
                 // (fallback); a unit is stopped whole, and confirmed, in should_start_server.
