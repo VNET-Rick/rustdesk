@@ -756,7 +756,11 @@ mod tests {
         // a nologin shell, which nobody has; a real user gets it.
         assert!(env.contains(&"LOGNAME=nobody".to_owned()), "{env:?}");
         assert!(env.contains(&"HOME=/nonexistent".to_owned()), "{env:?}");
-        assert!(!env.iter().any(|e| e.starts_with("SHELL=") && !e.ends_with("nologin")), "{env:?}");
+        assert!(
+            !env.iter()
+                .any(|e| e.starts_with("SHELL=") && !e.ends_with("nologin")),
+            "{env:?}"
+        );
     }
 
     #[test]
