@@ -805,7 +805,10 @@ impl Leftovers {
     }
 
     fn warn(&mut self, msg: String) {
-        if self.last_warn.map_or(true, |t| t.elapsed() >= LEFTOVER_WARN_EVERY) {
+        if self
+            .last_warn
+            .map_or(true, |t| t.elapsed() >= LEFTOVER_WARN_EVERY)
+        {
             log::error!("{msg}");
             self.last_warn = Some(Instant::now());
         }
@@ -841,7 +844,8 @@ impl Leftovers {
             self.done = true;
             return true;
         }
-        let msg = format!("startup: leftover units not stopped yet, not starting a server: {pending:?}");
+        let msg =
+            format!("startup: leftover units not stopped yet, not starting a server: {pending:?}");
         self.warn(msg);
         false
     }
@@ -1223,16 +1227,31 @@ f - rtprio -1
         );
         let has = |k: &str, v: u64| props.contains(&(k.to_owned(), v));
         // both sides always sent; the unnamed side is systemd's default
-        assert!(has("LimitCORESoft", 0) && has("LimitCORE", u64::MAX), "{props:?}");
+        assert!(
+            has("LimitCORESoft", 0) && has("LimitCORE", u64::MAX),
+            "{props:?}"
+        );
         // hard-only 8192 below the default soft 8M: soft clamped to the new hard
-        assert!(has("LimitSTACK", 8192) && has("LimitSTACKSoft", 8192), "{props:?}");
-        assert!(has("LimitNPROC", 500) && has("LimitNPROCSoft", 500), "{props:?}"); // clamped
-        assert!(has("LimitRTPRIOSoft", 5) && has("LimitRTPRIO", u64::MAX), "{props:?}");
+        assert!(
+            has("LimitSTACK", 8192) && has("LimitSTACKSoft", 8192),
+            "{props:?}"
+        );
+        assert!(
+            has("LimitNPROC", 500) && has("LimitNPROCSoft", 500),
+            "{props:?}"
+        ); // clamped
+        assert!(
+            has("LimitRTPRIOSoft", 5) && has("LimitRTPRIO", u64::MAX),
+            "{props:?}"
+        );
         assert!(has("LimitNOFILE", SUDO_NOFILE) && has("LimitNOFILESoft", SUDO_NOFILE));
         assert_eq!(props.len(), 10, "{props:?}"); // 5 limits x 2 sides
-        // a soft-only value above the inherited hard is clamped, never raises hard
+                                                  // a soft-only value above the inherited hard is clamped, never raises hard
         let p2 = limit_props_from(vec![("LimitNPROC", Some(900), None)], defaults);
-        assert!(p2.contains(&("LimitNPROC".to_owned(), 200)) && p2.contains(&("LimitNPROCSoft".to_owned(), 200)));
+        assert!(
+            p2.contains(&("LimitNPROC".to_owned(), 200))
+                && p2.contains(&("LimitNPROCSoft".to_owned(), 200))
+        );
         // a pam soft-only nofile keeps its soft value; the hard side is the sudo value
         let p3 = limit_props_from(vec![("LimitNOFILE", Some(4096), None)], defaults);
         assert!(p3.contains(&("LimitNOFILESoft".to_owned(), 4096)));
@@ -1256,11 +1275,22 @@ f - rtprio -1
         let _cleanup = Cleanup(path);
         let (core_soft_def, core_hard_def) = manager_default_limit("LimitCORE").unwrap();
         let (nproc_soft_def, _) = manager_default_limit("LimitNPROC").unwrap();
-        let unit = ServerUnit::start("65534", Path::new("/bin/sh"), &["-c", "exec sleep 300"], &[])
-            .unwrap_or_else(|_| panic!("start"));
+        let unit = ServerUnit::start(
+            "65534",
+            Path::new("/bin/sh"),
+            &["-c", "exec sleep 300"],
+            &[],
+        )
+        .unwrap_or_else(|_| panic!("start"));
         std::thread::sleep(Duration::from_millis(500));
         let cg = format!("/sys/fs/cgroup/system.slice/{}/cgroup.procs", unit.name());
-        let pid: u32 = std::fs::read_to_string(cg).unwrap().lines().next().unwrap().parse().unwrap();
+        let pid: u32 = std::fs::read_to_string(cg)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
         let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
         assert!(unit.stop());
         let fields = |prefix: &str| -> (String, String) {
@@ -1268,9 +1298,19 @@ f - rtprio -1
             let rest: Vec<&str> = l[prefix.len()..].split_whitespace().collect();
             (rest[0].to_owned(), rest[1].to_owned())
         };
-        let show = |v: u64| if v == u64::MAX { "unlimited".to_owned() } else { v.to_string() };
+        let show = |v: u64| {
+            if v == u64::MAX {
+                "unlimited".to_owned()
+            } else {
+                v.to_string()
+            }
+        };
         let _ = core_soft_def;
-        assert_eq!(fields("Max core file size"), ("0".to_owned(), show(core_hard_def)), "{limits}");
+        assert_eq!(
+            fields("Max core file size"),
+            ("0".to_owned(), show(core_hard_def)),
+            "{limits}"
+        );
         assert_eq!(
             fields("Max processes"),
             (show(nproc_soft_def.min(4242)), "4242".to_owned()),
