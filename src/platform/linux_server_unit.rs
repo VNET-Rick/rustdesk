@@ -357,6 +357,45 @@ mod tests {
         }
     }
 
+    /// Needs root and a running systemd (rdmdev host, not the build container):
+    ///   sudo <test-binary> --ignored --exact platform::linux_server_unit::tests::stop_kills_the_whole_tree
+    /// A tree with a background child and a setsid escapee (what --server/--tray/--cm look like to
+    /// the kernel) must be completely gone after stop(). Negative control: the same tree under
+    /// `sudo -u nobody` with sudo SIGKILLed leaves both sleeps running (see the PR's test log).
+    #[test]
+    #[ignore]
+    fn stop_kills_the_whole_tree() {
+        let unit = ServerUnit::start(
+            "65534",
+            Path::new("/bin/sh"),
+            &["-c", "sleep 300 & setsid sleep 300 & exec sleep 300"],
+            &[],
+        )
+        .expect("start");
+        std::thread::sleep(Duration::from_millis(500));
+        let pids = |name: &str| -> Vec<u32> {
+            let cg = format!("/sys/fs/cgroup/system.slice/{name}/cgroup.procs");
+            std::fs::read_to_string(cg)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        };
+        let before = pids(unit.name());
+        assert!(before.len() >= 3, "expected the tree in the unit's cgroup, got {before:?}");
+        assert!(!unit.has_exited());
+        unit.stop();
+        assert!(unit.has_exited());
+        for pid in before {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists()
+                    || std::fs::read_to_string(format!("/proc/{pid}/status"))
+                        .map_or(true, |s| s.contains("State:\tZ")),
+                "pid {pid} survived stop()"
+            );
+        }
+    }
+
     #[test]
     fn own_unit_parses_cgroup_v2() {
         assert_eq!(
