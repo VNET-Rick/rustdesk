@@ -539,11 +539,16 @@ fn watch_unconfirmed(name: &str) {
 /// Stop any watched unconfirmed unit that has come up after all. Cheap when the list is empty (the
 /// normal case); one GetUnit per watched name otherwise.
 pub fn reap_unconfirmed() {
-    let names = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let names = UNCONFIRMED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     for n in names {
         if let Ok(Some(state)) = active_state(&n, PROBE_CALL) {
             if state != "inactive" && state != "failed" {
-                log::error!("{n}: a start whose reply was lost came up late ({state}); stopping it");
+                log::error!(
+                    "{n}: a start whose reply was lost came up late ({state}); stopping it"
+                );
                 stop_unit_by_name(&n);
             }
         }
@@ -1299,7 +1304,7 @@ f - rtprio -1
         );
         assert!(has("LimitNOFILE", SUDO_NOFILE) && has("LimitNOFILESoft", SUDO_NOFILE));
         assert_eq!(props.len(), 10, "{props:?}"); // 5 limits x 2 sides
-        // a soft-only value above the inherited hard is clamped, never raises hard
+                                                  // a soft-only value above the inherited hard is clamped, never raises hard
         let p2 = limit_props_from(vec![("LimitNPROC", Some(900), None)], defaults).unwrap();
         assert!(
             p2.contains(&("LimitNPROC".to_owned(), 200))
