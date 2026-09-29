@@ -663,18 +663,23 @@ impl ServerUnit {
     }
 }
 
-/// systemd's major version (Manager.Version, e.g. "255.4-1ubuntu8.17" -> 255), read once; 0 if unknown.
+/// systemd's major version (Manager.Version, e.g. "255.4-1ubuntu8.17" -> 255); 0 if unknown. Cached
+/// once read; a failed read is not cached, so a bus hiccup at the first start does not stick.
 fn systemd_version() -> u32 {
-    static VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *VERSION.get_or_init(|| {
-        with_manager(PROBE_CALL, |m| {
-            use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
-            m.get::<String>(MANAGER, "Version")
-        })
-        .ok()
-        .and_then(|v| parse_systemd_version(&v))
-        .unwrap_or(0)
+    static VERSION: AtomicU32 = AtomicU32::new(0);
+    let cached = VERSION.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let v = with_manager(PROBE_CALL, |m| {
+        use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+        m.get::<String>(MANAGER, "Version")
     })
+    .ok()
+    .and_then(|v| parse_systemd_version(&v))
+    .unwrap_or(0);
+    VERSION.store(v, Ordering::Relaxed);
+    v
 }
 
 fn parse_systemd_version(v: &str) -> Option<u32> {
