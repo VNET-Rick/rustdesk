@@ -688,7 +688,9 @@ fn start_user_server(
             }
             // No server unit may run next to a sudo-started server.
             if let Err(e) = super::linux_server_unit::clear_gate() {
-                log::error!("cannot close the server-unit gate before the sudo fallback: {e}");
+                // Without a closed gate a late unit start could run next to the sudo server.
+                log::error!("cannot close the server-unit gate ({e}); not starting a server");
+                return Ok(None);
             }
             Ok(run_as_user(
                 vec!["--server"],
@@ -729,7 +731,8 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<ServerProce
         None => {
             // The root/headless server is a direct child; no user server unit may run next to it.
             if let Err(e) = super::linux_server_unit::clear_gate() {
-                log::error!("cannot close the server-unit gate before the root server: {e}");
+                log::error!("cannot close the server-unit gate ({e}); not starting the root server");
+                return Ok(None);
             }
             Ok(Some(ServerProcess::Child(crate::run_me(vec!["--server"])?)))
         }

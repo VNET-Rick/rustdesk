@@ -562,6 +562,7 @@ fn set_gate(name: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, GATE_FILE)
 }
 
+#[cfg(test)]
 fn gate_holds(name: &str) -> bool {
     std::fs::read_to_string(GATE_FILE).map_or(false, |s| s == name)
 }
@@ -571,12 +572,16 @@ pub fn clear_gate() -> std::io::Result<()> {
     set_gate("")
 }
 
-/// Close the gate if it still names `name` (that unit is being treated as gone).
-fn close_gate_for(name: &str) {
-    if gate_holds(name) {
-        if let Err(e) = set_gate("") {
+/// Make sure the gate does not name `name`. Ok = established (it names another unit, or it was
+/// cleared); an unreadable gate is cleared, never assumed closed. Err = exclusion NOT established:
+/// the caller must keep owning the unit and must not start another server.
+fn close_gate_for(name: &str) -> std::io::Result<()> {
+    match std::fs::read_to_string(GATE_FILE) {
+        Ok(s) if s != name => Ok(()),
+        _ => set_gate("").map_err(|e| {
             log::error!("cannot clear {GATE_FILE}: {e}");
-        }
+            e
+        }),
     }
 }
 
@@ -741,7 +746,7 @@ impl ServerUnit {
                 Ok(unit)
             }
             Err(e) if start_error_is_definite(&e) => {
-                close_gate_for(&unit.name);
+                let _ = close_gate_for(&unit.name); // never created: housekeeping only
                 not_created(e)
             }
             Err(e) => {
@@ -756,19 +761,36 @@ impl ServerUnit {
     /// exits within FAST_FAIL_WINDOW of the start (that we did not ask for) toward `degraded()`.
     pub fn has_exited(&self) -> bool {
         let age = self.started.elapsed();
-        let exited = match active_state(&self.name, PROBE_CALL) {
-            // A start whose reply was lost may not be processed yet: not gone before START_SETTLE.
-            // After that it is treated as gone and the gate is closed for it, so if systemd still
-            // executes it later, its ExecCondition skips it.
-            Ok(None) => self.confirmed.get() || age >= START_SETTLE,
+        let probe = |this: &Self| match active_state(&this.name, PROBE_CALL) {
+            Ok(None) => Some(None),
             Ok(Some(s)) => {
-                self.confirmed.set(true);
-                s == "inactive" || s == "failed"
+                this.confirmed.set(true);
+                Some(Some(s == "inactive" || s == "failed"))
             }
             Err(e) => {
-                log::warn!("{}: cannot read state: {e}", self.name);
-                false
+                log::warn!("{}: cannot read state: {e}", this.name);
+                None
             }
+        };
+        let exited = match probe(self) {
+            Some(Some(down)) => down,
+            // A confirmed unit that systemd no longer knows ran and was collected.
+            Some(None) if self.confirmed.get() => true,
+            // A start whose reply was lost may not be processed yet: not gone before START_SETTLE.
+            Some(None) if age < START_SETTLE => false,
+            // Then: close the gate FIRST, and only then look again. If it is still absent, any
+            // later execution of that start meets a closed gate and is skipped. If it appeared in
+            // between, it is ours and running (or done): keep tracking it. A gate that cannot be
+            // closed keeps ownership.
+            Some(None) => match close_gate_for(&self.name) {
+                Err(_) => false,
+                Ok(()) => match probe(self) {
+                    Some(Some(down)) => down,
+                    Some(None) => true,
+                    None => false,
+                },
+            },
+            None => false,
         };
         if !self.counted.get() && !self.stopping.get() {
             if exited && age < FAST_FAIL_WINDOW {
@@ -781,18 +803,23 @@ impl ServerUnit {
                 FAST_FAILS.store(0, Ordering::Relaxed);
             }
         }
-        if exited {
-            close_gate_for(&self.name);
+        if exited && self.confirmed.get() {
+            // Housekeeping only: a confirmed unit's start was executed once and names are never
+            // reused, so a stale gate cannot let anything else run.
+            let _ = close_gate_for(&self.name);
         }
         exited
     }
 
     /// Stop the unit; true once every process in it is gone. False = still running (or unknown):
     /// the caller keeps owning it and retries. The gate is closed first, so a start of this unit
-    /// that systemd has not executed yet (lost reply) can no longer run.
+    /// that systemd has not executed yet (lost reply) can no longer run; for an unconfirmed unit a
+    /// gate that cannot be closed means "not stopped".
     pub fn stop(&self) -> bool {
         self.stopping.set(true);
-        close_gate_for(&self.name);
+        if close_gate_for(&self.name).is_err() && !self.confirmed.get() {
+            return false;
+        }
         stop_unit_by_name(&self.name)
     }
 }
@@ -1505,6 +1532,63 @@ f - rtprio -1
             !gate_holds(cur.name()),
             "stop() must close the gate for its unit"
         );
+    }
+
+    /// An unconfirmed handle (lost start reply) for the next unit name, started `ago` ago.
+    fn lost_reply_handle(ago: Duration) -> ServerUnit {
+        let name = unit_name(65534, std::process::id(), SEQ.load(Ordering::Relaxed));
+        ServerUnit {
+            name,
+            started: Instant::now().checked_sub(ago).unwrap(),
+            stopping: Cell::new(false),
+            counted: Cell::new(true),
+            confirmed: Cell::new(false),
+        }
+    }
+
+    /// Root + systemd. Lost reply, then settle expires with no unit: has_exited() closes the gate
+    /// before it reports "gone", so when systemd executes that start afterwards it never runs.
+    #[test]
+    #[ignore]
+    fn lost_start_executed_after_it_was_given_up_never_runs() {
+        let marker = format!("/tmp/vnet-rd-gate-a-{}", std::process::id());
+        let _ = std::fs::remove_file(&marker);
+        let h = lost_reply_handle(START_SETTLE + Duration::from_secs(1));
+        set_gate(h.name()).unwrap(); // the gate still names the lost start
+        assert!(h.has_exited(), "no unit exists yet: must count as gone after settle");
+        assert!(!gate_holds(h.name()), "gate must be closed before reporting gone");
+        // Now systemd executes the lost start (same name).
+        let script = format!("touch {marker}; exec sleep 300");
+        let late = ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
+            .unwrap_or_else(|_| panic!("start"));
+        assert_eq!(late.name(), h.name());
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!Path::new(&marker).exists(), "the given-up start ran");
+        assert!(late.has_exited());
+        let _ = clear_gate();
+    }
+
+    /// Root + systemd. Lost reply, and the start lands (passes ExecCondition) before settle expires:
+    /// has_exited() closes the gate, looks again, finds it running, and keeps owning it.
+    #[test]
+    #[ignore]
+    fn lost_start_that_landed_is_kept_and_stopped() {
+        let marker = format!("/tmp/vnet-rd-gate-b-{}", std::process::id());
+        let _ = std::fs::remove_file(&marker);
+        let h = lost_reply_handle(START_SETTLE + Duration::from_secs(1));
+        set_gate(h.name()).unwrap();
+        let script = format!("touch {marker}; exec sleep 300");
+        let landed = ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
+            .unwrap_or_else(|_| panic!("start"));
+        assert_eq!(landed.name(), h.name());
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(Path::new(&marker).exists(), "the landed start should be running");
+        assert!(!h.has_exited(), "a running unit must not be reported gone");
+        assert!(h.confirmed.get(), "seeing it confirms it");
+        assert!(h.stop());
+        assert!(h.has_exited());
+        let _ = std::fs::remove_file(&marker);
+        let _ = clear_gate();
     }
 
     #[test]
