@@ -587,7 +587,10 @@ fn close_gate_for(name: &str) -> std::io::Result<()> {
 
 /// The ExecCondition command line for `name` (a validated unit name: [a-z0-9-.] only).
 pub fn gate_condition(name: &str) -> (String, Vec<String>, bool) {
-    debug_assert!(is_our_unit_name(name));
+    if !is_our_unit_name(name) {
+        // Never interpolate anything else into the shell line: such a unit must never run.
+        return ("/bin/false".to_owned(), vec!["/bin/false".to_owned()], false);
+    }
     let script = format!("[ \"$(cat {GATE_FILE} 2>/dev/null)\" = \"{name}\" ]");
     (
         "/bin/sh".to_owned(),
@@ -1499,6 +1502,9 @@ f - rtprio -1
             argv[2],
             "[ \"$(cat /run/vnet-rustdesk/current-server-unit 2>/dev/null)\" = \"rustdesk-server-1000-42-7.service\" ]"
         );
+        // anything that is not one of our unit names never reaches the shell line
+        let (p2, a2, _) = gate_condition("x\"; rm -rf / #.service");
+        assert_eq!((p2.as_str(), a2.len()), ("/bin/false", 1));
     }
 
     /// Root + systemd: a start that systemd executes after the gate moved on (what a lost-reply
