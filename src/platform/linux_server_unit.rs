@@ -519,40 +519,74 @@ pub enum StartError {
     Retry(String),
 }
 
-/// Units whose start was never confirmed and that were then treated as gone (lost start reply, then
-/// no such unit for START_SETTLE, or stopped while unconfirmed). systemd may still execute such a
-/// start later; `reap_unconfirmed()` checks these names every loop tick and stops any that appears.
-static UNCONFIRMED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-const UNCONFIRMED_CAP: usize = 64;
+// ---- the single-server gate ------------------------------------------------------------------
+// A start whose D-Bus reply was lost may still be executed by systemd later, after the loop has
+// moved on. Instead of chasing such a unit afterwards, every unit carries an ExecCondition that
+// lets it run only while its name is the one in GATE_FILE; the root service writes that file
+// (root-owned directory) before each start and clears it whenever the unit it names is treated as
+// gone. A superseded or abandoned unit that systemd starts late is skipped before the server
+// executes (ExecCondition failing = unit skipped, not failed).
+const GATE_DIR: &str = "/run/vnet-rustdesk";
+const GATE_FILE: &str = "/run/vnet-rustdesk/current-server-unit";
 
-fn watch_unconfirmed(name: &str) {
-    let mut w = UNCONFIRMED.lock().unwrap_or_else(|e| e.into_inner());
-    if !w.iter().any(|n| n == name) {
-        if w.len() >= UNCONFIRMED_CAP {
-            w.remove(0);
+/// Write `name` ("" = none) as the one unit allowed to run. The directory must be a real root-owned
+/// directory not writable by others; the file is replaced atomically and never through a symlink.
+fn set_gate(name: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::io::Write;
+    match std::fs::create_dir(GATE_DIR) {
+        Ok(()) => std::fs::set_permissions(GATE_DIR, std::fs::Permissions::from_mode(0o755))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let md = std::fs::symlink_metadata(GATE_DIR)?;
+    if !md.file_type().is_dir() || md.uid() != 0 || md.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{GATE_DIR} is not a root-owned directory writable only by root"),
+        ));
+    }
+    let tmp = format!("{GATE_DIR}/.current-server-unit.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(hbb_common::libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    f.write_all(name.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, GATE_FILE)
+}
+
+fn gate_holds(name: &str) -> bool {
+    std::fs::read_to_string(GATE_FILE).map_or(false, |s| s == name)
+}
+
+/// No unit may run (e.g. before a sudo-started fallback server, or at startup).
+pub fn clear_gate() -> std::io::Result<()> {
+    set_gate("")
+}
+
+/// Close the gate if it still names `name` (that unit is being treated as gone).
+fn close_gate_for(name: &str) {
+    if gate_holds(name) {
+        if let Err(e) = set_gate("") {
+            log::error!("cannot clear {GATE_FILE}: {e}");
         }
-        log::warn!("{name}: start never confirmed; watching for it");
-        w.push(name.to_owned());
     }
 }
 
-/// Stop any watched unconfirmed unit that has come up after all. Cheap when the list is empty (the
-/// normal case); one GetUnit per watched name otherwise.
-pub fn reap_unconfirmed() {
-    let names = UNCONFIRMED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    for n in names {
-        if let Ok(Some(state)) = active_state(&n, PROBE_CALL) {
-            if state != "inactive" && state != "failed" {
-                log::error!(
-                    "{n}: a start whose reply was lost came up late ({state}); stopping it"
-                );
-                stop_unit_by_name(&n);
-            }
-        }
-    }
+/// The ExecCondition command line for `name` (a validated unit name: [a-z0-9-.] only).
+pub fn gate_condition(name: &str) -> (String, Vec<String>, bool) {
+    debug_assert!(is_our_unit_name(name));
+    let script = format!("[ \"$(cat {GATE_FILE} 2>/dev/null)\" = \"{name}\" ]");
+    (
+        "/bin/sh".to_owned(),
+        vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+        false,
+    )
 }
 
 impl ServerUnit {
@@ -591,6 +625,18 @@ impl ServerUnit {
         args: &[&str],
         envs: &[(String, String)],
     ) -> Result<ServerUnit, StartError> {
+        Self::start_inner(uid, exe, args, envs, true)
+    }
+
+    /// `open_gate` = make this unit the one allowed to run (always, except in the test that plays a
+    /// superseded start executing late).
+    fn start_inner(
+        uid: &str,
+        exe: &Path,
+        args: &[&str],
+        envs: &[(String, String)],
+        open_gate: bool,
+    ) -> Result<ServerUnit, StartError> {
         if Self::degraded() {
             return Err(StartError::Degraded);
         }
@@ -603,6 +649,15 @@ impl ServerUnit {
         let Some(exe_s) = exe.to_str() else {
             return not_created(hbb_common::anyhow::anyhow!("non-UTF-8 executable path"));
         };
+        match systemd_version() {
+            0 => return Err(StartError::Retry("cannot read systemd's version".into())),
+            v if v < 243 => {
+                return not_created(hbb_common::anyhow::anyhow!(
+                    "systemd {v} has no ExecCondition= (needs 243)"
+                ))
+            }
+            _ => {}
+        }
         let name = unit_name(uid, std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
         let mut argv = vec![exe_s.to_owned()];
         argv.extend(args.iter().map(|a| a.to_string()));
@@ -614,6 +669,8 @@ impl ServerUnit {
                 "Description".into(),
                 v(format!("RustDesk server for uid {uid}")),
             ),
+            // Runs as User= before ExecStart; the server only starts while the gate names this unit.
+            ("ExecCondition".into(), v(vec![gate_condition(&name)])),
             ("ExecStart".into(), v(vec![(exe_s.to_owned(), argv, false)])),
             ("User".into(), v(uid.to_string())),
             ("Environment".into(), v(environment)),
@@ -641,6 +698,11 @@ impl ServerUnit {
             props.push(("BindsTo".into(), v(vec![parent.clone()])));
             props.push(("After".into(), v(vec![parent])));
         }
+        if open_gate {
+            if let Err(e) = set_gate(&name) {
+                return Err(StartError::Retry(format!("cannot write {GATE_FILE}: {e}")));
+            }
+        }
         let aux: Vec<(String, Vec<(String, Variant<Box<dyn RefArg>>)>)> = vec![];
         let res = with_manager(START_CALL, |m| {
             let (_job,): (DbusPath,) = m.method_call(
@@ -662,7 +724,10 @@ impl ServerUnit {
                 log::info!("started {} (uid {uid})", unit.name);
                 Ok(unit)
             }
-            Err(e) if start_error_is_definite(&e) => not_created(e),
+            Err(e) if start_error_is_definite(&e) => {
+                close_gate_for(&unit.name);
+                not_created(e)
+            }
             Err(e) => {
                 log::warn!("{}: start outcome unknown ({e}); tracking it", unit.name);
                 Ok(unit)
@@ -676,14 +741,10 @@ impl ServerUnit {
     pub fn has_exited(&self) -> bool {
         let age = self.started.elapsed();
         let exited = match active_state(&self.name, PROBE_CALL) {
-            // A start whose reply was lost may not be processed yet: not gone before START_SETTLE,
-            // and after that its name stays watched (reap_unconfirmed) in case it comes up late.
-            Ok(None) if self.confirmed.get() => true,
-            Ok(None) if age >= START_SETTLE => {
-                watch_unconfirmed(&self.name);
-                true
-            }
-            Ok(None) => false,
+            // A start whose reply was lost may not be processed yet: not gone before START_SETTLE.
+            // After that it is treated as gone and the gate is closed for it, so if systemd still
+            // executes it later, its ExecCondition skips it.
+            Ok(None) => self.confirmed.get() || age >= START_SETTLE,
             Ok(Some(s)) => {
                 self.confirmed.set(true);
                 s == "inactive" || s == "failed"
@@ -704,19 +765,19 @@ impl ServerUnit {
                 FAST_FAILS.store(0, Ordering::Relaxed);
             }
         }
+        if exited {
+            close_gate_for(&self.name);
+        }
         exited
     }
 
     /// Stop the unit; true once every process in it is gone. False = still running (or unknown):
-    /// the caller keeps owning it and retries.
+    /// the caller keeps owning it and retries. The gate is closed first, so a start of this unit
+    /// that systemd has not executed yet (lost reply) can no longer run.
     pub fn stop(&self) -> bool {
         self.stopping.set(true);
-        let gone = stop_unit_by_name(&self.name);
-        if gone && !self.confirmed.get() {
-            // "No such unit" for a start whose reply was lost may only mean "not yet".
-            watch_unconfirmed(&self.name);
-        }
-        gone
+        close_gate_for(&self.name);
+        stop_unit_by_name(&self.name)
     }
 }
 
@@ -880,6 +941,13 @@ impl Leftovers {
             return true;
         }
         if self.pending.is_none() {
+            // First, no leftover (or late-starting) unit of the previous instance may run.
+            if let Err(e) = clear_gate() {
+                self.warn(format!(
+                    "startup: cannot write {GATE_FILE} ({e}); not starting a server yet"
+                ));
+                return false;
+            }
             match list_server_units() {
                 Ok(names) => {
                     for n in &names {
@@ -1376,6 +1444,44 @@ f - rtprio -1
             (show(nproc_soft_def.min(4242)), "4242".to_owned()),
             "{limits}"
         );
+    }
+
+    #[test]
+    fn gate_condition_compares_the_gate_file_with_this_unit() {
+        let (path, argv, ignore) = gate_condition("rustdesk-server-1000-42-7.service");
+        assert_eq!(path, "/bin/sh");
+        assert!(!ignore);
+        assert_eq!(argv[..2], ["/bin/sh".to_owned(), "-c".to_owned()]);
+        assert_eq!(
+            argv[2],
+            "[ \"$(cat /run/vnet-rustdesk/current-server-unit 2>/dev/null)\" = \"rustdesk-server-1000-42-7.service\" ]"
+        );
+    }
+
+    /// Root + systemd: a start that systemd executes after the gate moved on (what a lost-reply
+    /// start looks like when it lands late) never runs its command; the current unit does.
+    #[test]
+    #[ignore]
+    fn superseded_unit_started_late_never_runs() {
+        let marker = format!("/tmp/vnet-rd-gate-test-{}", std::process::id());
+        let _ = std::fs::remove_file(&marker);
+        set_gate("rustdesk-server-1-1-1.service").unwrap(); // some other unit is current
+        let script = format!("touch {marker}; exec sleep 300");
+        let late = ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
+            .unwrap_or_else(|_| panic!("start"));
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!Path::new(&marker).exists(), "the superseded unit ran its command");
+        assert!(late.has_exited(), "the superseded unit is still up");
+        // Control: the same unit made current does run.
+        let cur = ServerUnit::start("65534", Path::new("/bin/sh"), &["-c", &script], &[])
+            .unwrap_or_else(|_| panic!("start"));
+        std::thread::sleep(Duration::from_millis(700));
+        let ran = Path::new(&marker).exists();
+        assert!(cur.stop());
+        let _ = std::fs::remove_file(&marker);
+        clear_gate().unwrap();
+        assert!(ran, "the current unit did not run");
+        assert!(!gate_holds(cur.name()), "stop() must close the gate for its unit");
     }
 
     #[test]

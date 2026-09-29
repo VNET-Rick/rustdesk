@@ -686,6 +686,10 @@ fn start_user_server(
                     return Ok(None);
                 }
             }
+            // No server unit may run next to a sudo-started server.
+            if let Err(e) = super::linux_server_unit::clear_gate() {
+                log::error!("cannot close the server-unit gate before the sudo fallback: {e}");
+            }
             Ok(run_as_user(
                 vec!["--server"],
                 Some((desktop.uid.clone(), desktop.username.clone())),
@@ -722,7 +726,13 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<ServerProce
             ));
             start_user_server(desktop, envs)
         }
-        None => Ok(Some(ServerProcess::Child(crate::run_me(vec!["--server"])?))),
+        None => {
+            // The root/headless server is a direct child; no user server unit may run next to it.
+            if let Err(e) = super::linux_server_unit::clear_gate() {
+                log::error!("cannot close the server-unit gate before the root server: {e}");
+            }
+            Ok(Some(ServerProcess::Child(crate::run_me(vec!["--server"])?)))
+        }
     }
 }
 
@@ -906,7 +916,6 @@ pub fn start_os_service() {
             sleep_millis(500);
             continue;
         }
-        super::linux_server_unit::reap_unconfirmed();
         desktop.refresh();
         update_active_user_lookup_cache(&desktop);
 
