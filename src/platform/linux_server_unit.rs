@@ -969,15 +969,23 @@ mod tests {
     #[test]
     #[ignore]
     fn leftovers_are_stopped_before_anything_starts() {
-        let unit = ServerUnit::start("65534", Path::new("/bin/sh"), &["-c", "exec sleep 300"], &[])
-            .unwrap_or_else(|_| panic!("start"));
+        let unit = ServerUnit::start(
+            "65534",
+            Path::new("/bin/sh"),
+            &["-c", "exec sleep 300"],
+            &[],
+        )
+        .unwrap_or_else(|_| panic!("start"));
         let name = unit.name().to_owned();
         drop(unit);
         std::thread::sleep(Duration::from_millis(300));
         assert!(matches!(active_state(&name, PROBE_CALL), Ok(Some(s)) if s == "active"));
         let mut leftovers = Leftovers::new();
         assert!(leftovers.settle());
-        assert!(matches!(active_state(&name, PROBE_CALL), Ok(None)), "{name} still there");
+        assert!(
+            matches!(active_state(&name, PROBE_CALL), Ok(None)),
+            "{name} still there"
+        );
         assert!(leftovers.settle()); // stays clean
     }
 
