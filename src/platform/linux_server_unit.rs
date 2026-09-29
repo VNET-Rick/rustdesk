@@ -532,8 +532,8 @@ const GATE_FILE: &str = "/run/vnet-rustdesk/current-server-unit";
 /// Write `name` ("" = none) as the one unit allowed to run. The directory must be a real root-owned
 /// directory not writable by others; the file is replaced atomically and never through a symlink.
 fn set_gate(name: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     match std::fs::create_dir(GATE_DIR) {
         Ok(()) => std::fs::set_permissions(GATE_DIR, std::fs::Permissions::from_mode(0o755))?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1467,10 +1467,14 @@ f - rtprio -1
         let _ = std::fs::remove_file(&marker);
         set_gate("rustdesk-server-1-1-1.service").unwrap(); // some other unit is current
         let script = format!("touch {marker}; exec sleep 300");
-        let late = ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
-            .unwrap_or_else(|_| panic!("start"));
+        let late =
+            ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
+                .unwrap_or_else(|_| panic!("start"));
         std::thread::sleep(Duration::from_millis(700));
-        assert!(!Path::new(&marker).exists(), "the superseded unit ran its command");
+        assert!(
+            !Path::new(&marker).exists(),
+            "the superseded unit ran its command"
+        );
         assert!(late.has_exited(), "the superseded unit is still up");
         // Control: the same unit made current does run.
         let cur = ServerUnit::start("65534", Path::new("/bin/sh"), &["-c", &script], &[])
@@ -1481,7 +1485,10 @@ f - rtprio -1
         let _ = std::fs::remove_file(&marker);
         clear_gate().unwrap();
         assert!(ran, "the current unit did not run");
-        assert!(!gate_holds(cur.name()), "stop() must close the gate for its unit");
+        assert!(
+            !gate_holds(cur.name()),
+            "stop() must close the gate for its unit"
+        );
     }
 
     #[test]
