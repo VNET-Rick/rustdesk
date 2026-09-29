@@ -1555,12 +1555,19 @@ f - rtprio -1
         let _ = std::fs::remove_file(&marker);
         let h = lost_reply_handle(START_SETTLE + Duration::from_secs(1));
         set_gate(h.name()).unwrap(); // the gate still names the lost start
-        assert!(h.has_exited(), "no unit exists yet: must count as gone after settle");
-        assert!(!gate_holds(h.name()), "gate must be closed before reporting gone");
+        assert!(
+            h.has_exited(),
+            "no unit exists yet: must count as gone after settle"
+        );
+        assert!(
+            !gate_holds(h.name()),
+            "gate must be closed before reporting gone"
+        );
         // Now systemd executes the lost start (same name).
         let script = format!("touch {marker}; exec sleep 300");
-        let late = ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
-            .unwrap_or_else(|_| panic!("start"));
+        let late =
+            ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
+                .unwrap_or_else(|_| panic!("start"));
         assert_eq!(late.name(), h.name());
         std::thread::sleep(Duration::from_millis(700));
         assert!(!Path::new(&marker).exists(), "the given-up start ran");
@@ -1578,11 +1585,15 @@ f - rtprio -1
         let h = lost_reply_handle(START_SETTLE + Duration::from_secs(1));
         set_gate(h.name()).unwrap();
         let script = format!("touch {marker}; exec sleep 300");
-        let landed = ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
-            .unwrap_or_else(|_| panic!("start"));
+        let landed =
+            ServerUnit::start_inner("65534", Path::new("/bin/sh"), &["-c", &script], &[], false)
+                .unwrap_or_else(|_| panic!("start"));
         assert_eq!(landed.name(), h.name());
         std::thread::sleep(Duration::from_millis(700));
-        assert!(Path::new(&marker).exists(), "the landed start should be running");
+        assert!(
+            Path::new(&marker).exists(),
+            "the landed start should be running"
+        );
         assert!(!h.has_exited(), "a running unit must not be reported gone");
         assert!(h.confirmed.get(), "seeing it confirms it");
         assert!(h.stop());

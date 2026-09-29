@@ -731,7 +731,9 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<ServerProce
         None => {
             // The root/headless server is a direct child; no user server unit may run next to it.
             if let Err(e) = super::linux_server_unit::clear_gate() {
-                log::error!("cannot close the server-unit gate ({e}); not starting the root server");
+                log::error!(
+                    "cannot close the server-unit gate ({e}); not starting the root server"
+                );
                 return Ok(None);
             }
             Ok(Some(ServerProcess::Child(crate::run_me(vec!["--server"])?)))
