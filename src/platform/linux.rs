@@ -868,9 +868,10 @@ fn force_stop_server() {
 
 pub fn start_os_service() {
     check_if_stop_service();
-    // VNET: server units a previous instance left behind (their whole cgroups), then upstream's
-    // name-based sweep for servers started the old way (sudo) before an upgrade.
-    super::linux_server_unit::sweep();
+    // VNET: server units a previous instance left behind are stopped (whole cgroups) before any
+    // server starts -- see `leftovers.settle()` in the loop. Upstream's name-based sweep below
+    // covers servers started the old way (sudo) before an upgrade.
+    let mut leftovers = super::linux_server_unit::Leftovers::new();
     stop_rustdesk_servers();
     stop_subprocess();
     start_uinput_service();
@@ -896,6 +897,10 @@ pub fn start_os_service() {
     let mut cm0 = false;
     let mut last_restart = Instant::now();
     while running.load(Ordering::SeqCst) {
+        if !leftovers.settle() {
+            sleep_millis(500);
+            continue;
+        }
         desktop.refresh();
         update_active_user_lookup_cache(&desktop);
 

@@ -68,13 +68,38 @@ const INHERITED_ENV: &[&str] = &[
 ];
 /// Open-files limit the sudo-started server had on boostlap (soft = hard = 1048576).
 const SUDO_NOFILE: u64 = 1_048_576;
-/// A unit that exits this soon after starting counts as a failed start.
+/// A unit that exits this soon after starting counts as a failed start; one that has run this long
+/// is healthy and resets the count.
 const FAST_FAIL_WINDOW: Duration = Duration::from_secs(10);
-/// After this many failed starts in a row, the caller falls back to sudo for the service's lifetime.
+/// After this many failed starts in a row the caller falls back to sudo ("degraded") ... Any early
+/// exit counts, including a server that crashes by itself (a unit's exec failure and an app crash look
+/// the same once the unit is collected); that is why degrading is bounded in time and a healthy run
+/// ends the streak.
 const FAST_FAIL_LIMIT: u32 = 3;
+/// ... and tries units again after this long.
+const DEGRADED_RETRY: Duration = Duration::from_secs(600);
+/// Startup: how long listing leftover units may keep failing (bus down) before starting anyway.
+const LIST_GIVE_UP: Duration = Duration::from_secs(30);
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static FAST_FAILS: AtomicU32 = AtomicU32::new(0);
+static DEGRADED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// The request never reached the bus (no connection): systemd cannot have acted on it.
+#[derive(Debug)]
+struct NotSent(dbus::Error);
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "system bus unavailable: {}", self.0)
+    }
+}
+
+impl std::error::Error for NotSent {}
+
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
 
 /// A D-Bus variant of any argument type (for the a(sv) property list).
 fn v<T: RefArg + 'static>(x: T) -> Variant<Box<dyn RefArg>> {
@@ -108,8 +133,9 @@ fn is_connection_error(e: &dbus::Error) -> bool {
     }
 }
 
-/// Run `f` against a proxy for `path` with `timeout`. Any error other than "no such unit/object"
-/// drops the cached connection, so a dead bus connection is replaced on the next call.
+/// Run `f` against a proxy for `path` with `timeout`. A connection error drops the cached
+/// connection, so a dead one is replaced on the next call; a failed connect is `NotSent`.
+/// (Connecting is a local unix-socket connect + auth; it has no timeout of its own.)
 fn with_proxy<T>(
     path: DbusPath<'static>,
     timeout: Duration,
@@ -118,7 +144,7 @@ fn with_proxy<T>(
     BUS.with(|bus| {
         let mut bus = bus.borrow_mut();
         if bus.is_none() {
-            *bus = Some(Connection::new_system()?);
+            *bus = Some(Connection::new_system().map_err(NotSent)?);
         }
         let res = {
             let conn = bus.as_ref().unwrap();
@@ -239,16 +265,46 @@ const LIMIT_ITEMS: &[(&str, &str)] = &[
     ("cpu", "LimitCPU"),
 ];
 
-/// Effective (soft, hard) per systemd property, from pam_limits text `sources` for `user` in `groups`.
-/// Later lines override earlier ones (pam_limits reads limits.conf, then limits.d in order). Units are
-/// converted to what systemd expects: KiB -> bytes for memlock/core/stack/as/fsize/data, minutes ->
-/// seconds for cpu, nice as the 20-based rlimit value. Unknown items/values are ignored.
+/// How specific a limits.conf domain is, pam_limits style: lower = more specific. A line only
+/// overrides a side (soft/hard) that was set by an equally or less specific line, so `alice` beats a
+/// later `*`, and among equals the later line wins (limits.conf, then limits.d in name order).
+fn domain_priority(domain: &str, user: &str, uid: u32, groups: &[String]) -> Option<u8> {
+    if domain == user {
+        return Some(0);
+    }
+    // uid ranges: "min:max", "min:", ":max", or "n:" (pam_limits: a user-class match).
+    if let Some((lo, hi)) = domain.split_once(':') {
+        if !domain.starts_with('@') && !domain.starts_with('%') {
+            let lo = if lo.is_empty() { Some(0) } else { lo.parse::<u32>().ok() };
+            let hi = if hi.is_empty() { Some(u32::MAX) } else { hi.parse::<u32>().ok() };
+            return match (lo, hi) {
+                (Some(lo), Some(hi)) if lo <= uid && uid <= hi => Some(0),
+                _ => None,
+            };
+        }
+    }
+    if let Some(g) = domain.strip_prefix('@') {
+        return groups.iter().any(|x| x == g).then_some(1);
+    }
+    (domain == "*").then_some(3)
+}
+
+/// Effective (soft, hard) per systemd property, from pam_limits text `sources` for `user`/`uid` in
+/// `groups`. Only the side(s) a line names are set (`soft`, `hard`, or both for `-`); a side no line
+/// names stays None. Units are converted to what systemd expects: KiB -> bytes for
+/// memlock/core/stack/as/fsize/data, minutes -> seconds for cpu, nice as the 20-based rlimit value
+/// (clamped to -20..19; "-1"/"unlimited" for nice means nice -1, as in pam_limits). nofile
+/// "unlimited" becomes `nr_open` (pam_limits does the same). Unknown items/values are ignored.
 pub fn pam_limits_for(
     sources: &[String],
     user: &str,
+    uid: u32,
     groups: &[String],
+    nr_open: u64,
 ) -> Vec<(&'static str, Option<u64>, Option<u64>)> {
-    let mut out: Vec<(&'static str, Option<u64>, Option<u64>)> = Vec::new();
+    // (prop, soft (value, prio), hard (value, prio))
+    type Side = Option<(u64, u8)>;
+    let mut out: Vec<(&'static str, Side, Side)> = Vec::new();
     for text in sources {
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -257,24 +313,28 @@ pub fn pam_limits_for(
                 continue;
             }
             let (domain, kind, item, value) = (f[0], f[1], f[2], f[3]);
-            let applies = domain == user
-                || domain == "*"
-                || domain
-                    .strip_prefix('@')
-                    .map_or(false, |g| groups.iter().any(|x| x == g));
-            if !applies {
+            let Some(prio) = domain_priority(domain, user, uid, groups) else {
                 continue;
-            }
+            };
             let Some(&(_, prop)) = LIMIT_ITEMS.iter().find(|(i, _)| *i == item) else {
                 continue;
             };
-            let val = if matches!(value, "unlimited" | "infinity" | "-1") {
-                u64::MAX
-            } else if item == "nice" {
-                // pam_limits: nice value n in -20..19 -> rlimit 20 - n.
-                match value.parse::<i64>() {
-                    Ok(n) if (-20..=19).contains(&n) => (20 - n) as u64,
-                    _ => continue,
+            let unlimited = matches!(value.to_ascii_lowercase().as_str(), "unlimited" | "infinity" | "-1");
+            let val = if item == "nice" {
+                let n = if unlimited {
+                    -1
+                } else {
+                    match value.parse::<i64>() {
+                        Ok(n) => n.clamp(-20, 19),
+                        Err(_) => continue,
+                    }
+                };
+                (20 - n) as u64
+            } else if unlimited {
+                if item == "nofile" {
+                    nr_open
+                } else {
+                    u64::MAX
                 }
             } else {
                 let Ok(n) = value.parse::<u64>() else {
@@ -295,18 +355,49 @@ pub fn pam_limits_for(
                     out.len() - 1
                 }
             };
+            let set = |side: &mut Side| {
+                if side.map_or(true, |(_, p)| prio <= p) {
+                    *side = Some((val, prio));
+                }
+            };
             match kind {
-                "soft" => out[idx].1 = Some(val),
-                "hard" => out[idx].2 = Some(val),
+                "soft" => set(&mut out[idx].1),
+                "hard" => set(&mut out[idx].2),
                 "-" => {
-                    out[idx].1 = Some(val);
-                    out[idx].2 = Some(val);
+                    set(&mut out[idx].1);
+                    set(&mut out[idx].2);
                 }
                 _ => {}
             }
         }
     }
-    out
+    out.into_iter()
+        .map(|(p, s, h)| (p, s.map(|x| x.0), h.map(|x| x.0)))
+        .collect()
+}
+
+/// The systemd properties for a limit set: `LimitX` = hard, `LimitXSoft` = soft, only for the sides
+/// that are set (an unset side keeps systemd's default for system units, as it did under sudo). A soft
+/// value above an explicit hard one is clamped. NOFILE defaults to what the sudo-started server had.
+pub fn limit_props_from(limits: Vec<(&'static str, Option<u64>, Option<u64>)>) -> Vec<(String, u64)> {
+    let mut limits = limits;
+    match limits.iter_mut().find(|(p, _, _)| *p == "LimitNOFILE") {
+        Some(l) => {
+            l.1 = l.1.or(Some(SUDO_NOFILE.min(l.2.unwrap_or(u64::MAX))));
+            l.2 = l.2.or(Some(SUDO_NOFILE.max(l.1.unwrap_or(0))));
+        }
+        None => limits.push(("LimitNOFILE", Some(SUDO_NOFILE), Some(SUDO_NOFILE))),
+    }
+    let mut props = Vec::new();
+    for (prop, soft, hard) in limits {
+        if let Some(h) = hard {
+            props.push((prop.to_owned(), h));
+        }
+        if let Some(s) = soft {
+            props.push((format!("{prop}Soft"), s.min(hard.unwrap_or(u64::MAX))));
+        }
+    }
+    props
 }
 
 fn read_limits_sources() -> Vec<String> {
@@ -344,27 +435,25 @@ fn limit_properties(uid: u32) -> Vec<(String, u64)> {
         }
         None => (String::new(), Vec::new()),
     };
-    let mut limits = pam_limits_for(&read_limits_sources(), &name, &groups);
-    if !limits.iter().any(|(p, _, _)| *p == "LimitNOFILE") {
-        limits.push(("LimitNOFILE", Some(SUDO_NOFILE), Some(SUDO_NOFILE)));
-    }
-    let mut props = Vec::new();
-    for (prop, soft, hard) in limits {
-        // systemd's LimitX sets the hard limit, LimitXSoft the soft one.
-        if let Some(h) = hard.or(soft) {
-            props.push((prop.to_owned(), h));
-        }
-        if let Some(s) = soft.or(hard) {
-            props.push((format!("{prop}Soft"), s.min(hard.unwrap_or(u64::MAX))));
-        }
-    }
-    props
+    let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(SUDO_NOFILE);
+    limit_props_from(pam_limits_for(
+        &read_limits_sources(),
+        &name,
+        uid,
+        &groups,
+        nr_open,
+    ))
 }
 
 pub struct ServerUnit {
     name: String,
     started: Instant,
     stopping: Cell<bool>,
+    /// Already counted toward (or cleared) the fast-fail streak.
+    counted: Cell<bool>,
 }
 
 /// Why a start produced no unit.
@@ -380,15 +469,28 @@ impl ServerUnit {
         &self.name
     }
 
-    /// True when repeated units have died right after starting; the caller should use its fallback.
+    /// True while repeated units have died right after starting (the caller uses its fallback);
+    /// after DEGRADED_RETRY units are tried again.
     pub fn degraded() -> bool {
-        FAST_FAILS.load(Ordering::Relaxed) >= FAST_FAIL_LIMIT
+        if FAST_FAILS.load(Ordering::Relaxed) < FAST_FAIL_LIMIT {
+            return false;
+        }
+        let mut at = DEGRADED_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let since = *at.get_or_insert_with(Instant::now);
+        if since.elapsed() >= DEGRADED_RETRY {
+            log::warn!("server units: retrying after {:?} degraded", since.elapsed());
+            FAST_FAILS.store(0, Ordering::Relaxed);
+            *at = None;
+            return false;
+        }
+        true
     }
 
-    /// Start `exe args...` as `uid` in a new transient unit. An uncertain outcome (e.g. the call timed
-    /// out after systemd accepted it) still returns the unit: it is tracked by name, and if it never
-    /// came up `has_exited()` says so on the next tick. Only a start systemd provably did not perform
-    /// is `NotCreated`, so a fallback can never run next to an untracked unit.
+    /// Start `exe args...` as `uid` in a new transient unit. Only an outcome where systemd provably
+    /// did not create the unit is `NotCreated` (the request never left: no bus connection; or systemd
+    /// answered with an error). A lost reply (timeout, disconnect) is ambiguous: systemd may still act
+    /// on the request, so the unit is tracked by name and never paired with a fallback; if it never
+    /// comes up, `has_exited()` says so and the next start is again a unit.
     pub fn start(
         uid: &str,
         exe: &Path,
@@ -422,14 +524,17 @@ impl ServerUnit {
             ("User".into(), v(uid.to_string())),
             ("Environment".into(), v(environment)),
             ("UMask".into(), v(0o022u32)),
-            // HOME, SHELL, LOGNAME from the passwd entry (systemd >= 255; sudo gave the server SHELL and
-            // terminal_service.rs uses it). Environment= still wins for HOME when the desktop has one.
-            ("SetLoginEnvironment".into(), v(true)),
             ("KillMode".into(), v("control-group".to_owned())),
             ("TimeoutStopUSec".into(), v(STOP_TIMEOUT_USEC)),
             // Gone as soon as it stops or fails: no "failed" leftovers; names are never reused anyway.
             ("CollectMode".into(), v("inactive-or-failed".to_owned())),
         ];
+        if systemd_version() >= 255 {
+            // HOME, SHELL, LOGNAME from the passwd entry (sudo gave the server SHELL and
+            // terminal_service.rs uses it). Environment= still wins for HOME when the desktop has one.
+            // Older systemd rejects the property (the whole start would fail), so it is only sent here.
+            props.push(("SetLoginEnvironment".into(), v(true)));
+        }
         for (prop, val) in limit_properties(uid) {
             props.push((prop, v(val)));
         }
@@ -451,29 +556,18 @@ impl ServerUnit {
             name,
             started: Instant::now(),
             stopping: Cell::new(false),
+            counted: Cell::new(false),
         };
         match res {
             Ok(()) => {
                 log::info!("started {} (uid {uid})", unit.name);
                 Ok(unit)
             }
-            Err(e) => match active_state(&unit.name) {
-                Ok(None) => not_created(e),
-                Ok(Some(state)) => {
-                    log::warn!(
-                        "{}: start reported '{e}' but the unit exists ({state}); tracking it",
-                        unit.name
-                    );
-                    Ok(unit)
-                }
-                Err(probe) => {
-                    log::warn!(
-                        "{}: start outcome unknown ('{e}', then '{probe}'); tracking it",
-                        unit.name
-                    );
-                    Ok(unit)
-                }
-            },
+            Err(e) if start_error_is_definite(&e) => not_created(e),
+            Err(e) => {
+                log::warn!("{}: start outcome unknown ({e}); tracking it", unit.name);
+                Ok(unit)
+            }
         }
     }
 
@@ -481,7 +575,7 @@ impl ServerUnit {
     /// "still running": restarting on a transient bus hiccup would start a second server. Counts
     /// exits within FAST_FAIL_WINDOW of the start (that we did not ask for) toward `degraded()`.
     pub fn has_exited(&self) -> bool {
-        let exited = match active_state(&self.name) {
+        let exited = match active_state(&self.name, PROBE_CALL) {
             Ok(None) => true,
             Ok(Some(s)) => s == "inactive" || s == "failed",
             Err(e) => {
@@ -489,15 +583,15 @@ impl ServerUnit {
                 false
             }
         };
-        if exited && !self.stopping.get() {
-            if self.started.elapsed() < FAST_FAIL_WINDOW {
+        let age = self.started.elapsed();
+        if !self.counted.get() && !self.stopping.get() {
+            if exited && age < FAST_FAIL_WINDOW {
+                self.counted.set(true);
                 let n = FAST_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
-                log::error!(
-                    "{} exited {:?} after starting ({n} in a row)",
-                    self.name,
-                    self.started.elapsed()
-                );
-            } else {
+                log::error!("{} exited {age:?} after starting ({n} in a row)", self.name);
+            } else if age >= FAST_FAIL_WINDOW {
+                // Ran long enough (whether it is still up or exited later): the streak is over.
+                self.counted.set(true);
                 FAST_FAILS.store(0, Ordering::Relaxed);
             }
         }
@@ -512,16 +606,52 @@ impl ServerUnit {
     }
 }
 
-/// The unit's ActiveState; None when systemd no longer knows it (stopped and collected).
-fn active_state(name: &str) -> ResultType<Option<String>> {
-    let unit = with_manager(PROBE_CALL, |m| {
+/// systemd's major version (Manager.Version, e.g. "255.4-1ubuntu8.17" -> 255), read once; 0 if unknown.
+fn systemd_version() -> u32 {
+    static VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        with_manager(PROBE_CALL, |m| {
+            use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+            m.get::<String>(MANAGER, "Version")
+        })
+        .ok()
+        .and_then(|v| parse_systemd_version(&v))
+        .unwrap_or(0)
+    })
+}
+
+fn parse_systemd_version(v: &str) -> Option<u32> {
+    let digits: String = v
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// A StartTransientUnit failure that proves systemd did not create the unit: the request never left
+/// (no connection), or systemd itself answered with an error. Lost replies are not definite.
+fn start_error_is_definite(e: &hbb_common::anyhow::Error) -> bool {
+    if e.downcast_ref::<NotSent>().is_some() {
+        return true;
+    }
+    match e.downcast_ref::<dbus::Error>() {
+        Some(d) => !is_connection_error(d),
+        None => false,
+    }
+}
+
+/// The unit's ActiveState; None when systemd no longer knows it (stopped and collected). Two calls,
+/// each bounded by `per_call`.
+fn active_state(name: &str, per_call: Duration) -> ResultType<Option<String>> {
+    let unit = with_manager(per_call, |m| {
         let (p,): (DbusPath<'static>,) = m.method_call(MANAGER, "GetUnit", (name,))?;
         Ok(p)
     });
     if dbus_err_is(&unit, &[NO_SUCH_UNIT]) {
         return Ok(None);
     }
-    let state = with_proxy(unit?, PROBE_CALL, |p| {
+    let state = with_proxy(unit?, per_call, |p| {
         use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
         p.get::<String>(UNIT_IFACE, "ActiveState")
     });
@@ -541,8 +671,10 @@ fn stop_unit_by_name(name: &str) -> bool {
         log::error!("refusing to stop '{name}': not a server unit");
         return false;
     }
+    // Every call below is bounded by what is left of this budget.
     let deadline = Instant::now() + STOP_DEADLINE;
-    let res = with_manager(STOP_CALL, |m| {
+    let kill_phase = deadline - Duration::from_secs(1); // 1 s kept for the SIGKILL path
+    let res = with_manager(STOP_CALL.min(remaining(kill_phase)), |m| {
         let (_job,): (DbusPath,) = m.method_call(MANAGER, "StopUnit", (name, "replace"))?;
         Ok(())
     });
@@ -552,18 +684,19 @@ fn stop_unit_by_name(name: &str) -> bool {
     if let Err(e) = res {
         log::error!("{name}: StopUnit failed: {e}");
     }
-    // Leave 1 s of the budget for the SIGKILL path.
-    if wait_down(name, deadline - Duration::from_secs(1)) {
+    if wait_down(name, kill_phase) {
         log::info!("stopped {name}");
         return true;
     }
     // systemd SIGKILLs the cgroup after TimeoutStopSec on its own; this covers a stop job that
     // never ran (e.g. StopUnit itself failed).
     log::error!("{name}: still up; sending SIGKILL to the whole unit");
-    let _ = with_manager(
-        STOP_CALL.min(deadline.saturating_duration_since(Instant::now())),
-        |m| m.method_call::<(), _, _, _>(MANAGER, "KillUnit", (name, "all", 9i32)),
-    );
+    let left = remaining(deadline);
+    if !left.is_zero() {
+        let _ = with_manager(STOP_CALL.min(left), |m| {
+            m.method_call::<(), _, _, _>(MANAGER, "KillUnit", (name, "all", 9i32))
+        });
+    }
     if wait_down(name, deadline) {
         return true;
     }
@@ -571,27 +704,82 @@ fn stop_unit_by_name(name: &str) -> bool {
     false
 }
 
+/// Poll until the unit is down or `deadline`; each probe is bounded by the time left. Units are
+/// CollectMode=inactive-or-failed, so a down unit disappears on its own (no ResetFailedUnit needed).
 fn wait_down(name: &str, deadline: Instant) -> bool {
     loop {
-        let state = active_state(name);
-        if is_down(&state) {
-            if matches!(state, Ok(Some(_))) {
-                let _ = with_manager(PROBE_CALL, |m| {
-                    m.method_call::<(), _, _, _>(MANAGER, "ResetFailedUnit", (name,))
-                });
-            }
-            return true;
-        }
-        if Instant::now() >= deadline {
+        let left = remaining(deadline);
+        if left.is_zero() {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // Two calls per probe: give each half of what is left, at most PROBE_CALL.
+        if is_down(&active_state(name, PROBE_CALL.min(left / 2))) {
+            return true;
+        }
+        let left = remaining(deadline);
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50).min(left));
     }
 }
 
-/// Startup: stop every server unit a previous service instance left behind.
-pub fn sweep() {
-    let listed = with_manager(START_CALL, |m| {
+/// Server units a previous service instance left behind. Nothing may start until they are
+/// confirmed gone (the startup equivalent of a pending stop).
+pub struct Leftovers {
+    /// None = not listed yet.
+    pending: Option<Vec<String>>,
+    since: Instant,
+    warned: bool,
+}
+
+impl Leftovers {
+    pub fn new() -> Self {
+        Leftovers {
+            pending: None,
+            since: Instant::now(),
+            warned: false,
+        }
+    }
+
+    /// Try to finish the startup cleanup; true once nothing is left (cheap after that).
+    /// Listing that keeps failing (no bus) gives up after LIST_GIVE_UP so remote access still
+    /// starts (the start then falls back to sudo, since no unit can be created without the bus).
+    /// Units that are listed but will not stop block starting until they do.
+    pub fn settle(&mut self) -> bool {
+        if self.pending.is_none() {
+            match list_server_units() {
+                Ok(names) => {
+                    for n in &names {
+                        log::info!("startup: stopping leftover {n}");
+                    }
+                    self.pending = Some(names);
+                }
+                Err(e) if self.since.elapsed() >= LIST_GIVE_UP => {
+                    log::error!(
+                        "startup: cannot list leftover server units for {:?} ({e}); starting anyway",
+                        self.since.elapsed()
+                    );
+                    self.pending = Some(Vec::new());
+                }
+                Err(e) => {
+                    log::warn!("startup: cannot list leftover server units yet: {e}");
+                    return false;
+                }
+            }
+        }
+        let pending = self.pending.as_mut().unwrap();
+        pending.retain(|n| !stop_unit_by_name(n));
+        if !pending.is_empty() && !self.warned {
+            log::error!("startup: leftover units not stopped yet, not starting a server: {pending:?}");
+            self.warned = true;
+        }
+        pending.is_empty()
+    }
+}
+
+fn list_server_units() -> ResultType<Vec<String>> {
+    with_manager(START_CALL, |m| {
         type Row = (
             String,
             String,
@@ -612,17 +800,12 @@ pub fn sweep() {
                 vec![format!("{UNIT_PREFIX}*.service")],
             ),
         )?;
-        Ok(rows.into_iter().map(|r| r.0).collect::<Vec<String>>())
-    });
-    match listed {
-        Ok(names) => {
-            for n in names.iter().filter(|n| is_our_unit_name(n)) {
-                log::info!("sweep: stopping leftover {n}");
-                stop_unit_by_name(n);
-            }
-        }
-        Err(e) => log::warn!("sweep: cannot list server units: {e}"),
-    }
+        Ok(rows
+            .into_iter()
+            .map(|r| r.0)
+            .filter(|n| is_our_unit_name(n))
+            .collect::<Vec<String>>())
+    })
 }
 
 #[cfg(test)]
@@ -829,7 +1012,7 @@ alice       soft nofile 2048   # trailing comment
         let later = "alice soft nofile 3000\n".to_owned();
         let get = |user: &str, groups: &[&str]| {
             let g: Vec<String> = groups.iter().map(|s| s.to_string()).collect();
-            pam_limits_for(&[conf.clone(), later.clone()], user, &g)
+            pam_limits_for(&[conf.clone(), later.clone()], user, 1000, &g, 1 << 20)
         };
         let alice = get("alice", &[]);
         assert!(
@@ -848,5 +1031,97 @@ alice       soft nofile 2048   # trailing comment
             "{pw:?}"
         );
         assert!(!get("bob", &[]).iter().any(|(p, _, _)| *p == "LimitRTPRIO"));
+    }
+
+    #[test]
+    fn pam_limits_specific_beats_later_wildcard_and_sides_stay_separate() {
+        let conf = "\
+alice   -    nofile 4096
+*       -    nofile 1024
+@staff  hard nofile 2048
+*       soft core   0
+bob     hard core   100
+1000:1999 - nproc 500
+*       -    nproc 50
+"
+        .to_owned();
+        let later = "*    -  nofile 999\n".to_owned();
+        let g = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let alice = pam_limits_for(&[conf.clone(), later.clone()], "alice", 1500, &g(&["staff"]), 1 << 20);
+        // user line beats the group line and both later '*' lines, on both sides
+        assert!(alice.contains(&("LimitNOFILE", Some(4096), Some(4096))), "{alice:?}");
+        // soft-only line sets only the soft side
+        assert!(alice.contains(&("LimitCORE", Some(0), None)), "{alice:?}");
+        // uid range is user-class: beats the later '*'
+        assert!(alice.contains(&("LimitNPROC", Some(500), Some(500))), "{alice:?}");
+        let carol = pam_limits_for(&[conf.clone(), later.clone()], "carol", 3000, &g(&["staff"]), 1 << 20);
+        // group (hard) beats '*' on the hard side; the later '*' still sets the soft side
+        assert!(carol.contains(&("LimitNOFILE", Some(999), Some(2048))), "{carol:?}");
+        assert!(carol.contains(&("LimitNPROC", Some(50), Some(50))), "{carol:?}");
+        let bob = pam_limits_for(&[conf], "bob", 3000, &[], 1 << 20);
+        assert!(bob.contains(&("LimitCORE", Some(0), Some(100 * 1024))), "{bob:?}");
+    }
+
+    #[test]
+    fn pam_limits_special_values() {
+        let conf = "\
+a - nice -1
+b - nice unlimited
+c - nice -40
+d - nofile unlimited
+e - memlock unlimited
+f - rtprio -1
+"
+        .to_owned();
+        let one = |u: &str| pam_limits_for(&[conf.clone()], u, 1000, &[], 1_048_576);
+        assert!(one("a").contains(&("LimitNICE", Some(21), Some(21))));
+        assert!(one("b").contains(&("LimitNICE", Some(21), Some(21))));
+        assert!(one("c").contains(&("LimitNICE", Some(40), Some(40)))); // clamped to -20
+        assert!(one("d").contains(&("LimitNOFILE", Some(1_048_576), Some(1_048_576))));
+        assert!(one("e").contains(&("LimitMEMLOCK", Some(u64::MAX), Some(u64::MAX))));
+        assert!(one("f").contains(&("LimitRTPRIO", Some(u64::MAX), Some(u64::MAX))));
+    }
+
+    #[test]
+    fn limit_props_map_sides_and_default_nofile() {
+        let props = limit_props_from(vec![
+            ("LimitCORE", Some(0), None),
+            ("LimitSTACK", None, Some(8192)),
+            ("LimitNPROC", Some(900), Some(500)),
+        ]);
+        let has = |k: &str, v: u64| props.contains(&(k.to_owned(), v));
+        assert!(has("LimitCORESoft", 0) && !props.iter().any(|(k, _)| k == "LimitCORE"));
+        assert!(has("LimitSTACK", 8192) && !props.iter().any(|(k, _)| k == "LimitSTACKSoft"));
+        assert!(has("LimitNPROC", 500) && has("LimitNPROCSoft", 500)); // soft clamped to hard
+        assert!(has("LimitNOFILE", SUDO_NOFILE) && has("LimitNOFILESoft", SUDO_NOFILE));
+        // a pam soft-only nofile keeps its soft value; the hard side is the sudo value
+        let p2 = limit_props_from(vec![("LimitNOFILE", Some(4096), None)]);
+        assert!(p2.contains(&("LimitNOFILESoft".to_owned(), 4096)));
+        assert!(p2.contains(&("LimitNOFILE".to_owned(), SUDO_NOFILE)));
+    }
+
+    #[test]
+    fn systemd_versions_parse() {
+        assert_eq!(parse_systemd_version("255.4-1ubuntu8.17"), Some(255));
+        assert_eq!(parse_systemd_version("259"), Some(259));
+        assert_eq!(parse_systemd_version("v249.11"), Some(249));
+        assert_eq!(parse_systemd_version(""), None);
+        assert_eq!(parse_systemd_version("abc"), None);
+    }
+
+    #[test]
+    fn start_errors_are_definite_only_when_systemd_cannot_have_acted() {
+        let de = |name: &str| {
+            hbb_common::anyhow::Error::from(dbus::Error::new_custom(name, "x"))
+        };
+        assert!(start_error_is_definite(&de("org.freedesktop.DBus.Error.InvalidArgs")));
+        assert!(start_error_is_definite(&de("org.freedesktop.DBus.Error.AccessDenied")));
+        assert!(start_error_is_definite(&hbb_common::anyhow::Error::from(NotSent(
+            dbus::Error::new_custom("org.freedesktop.DBus.Error.FileNotFound", "x")
+        ))));
+        assert!(!start_error_is_definite(&de("org.freedesktop.DBus.Error.NoReply")));
+        assert!(!start_error_is_definite(&de("org.freedesktop.DBus.Error.Timeout")));
+        assert!(!start_error_is_definite(&de("org.freedesktop.DBus.Error.Disconnected")));
+        assert!(!start_error_is_definite(&hbb_common::anyhow::anyhow!("other")));
     }
 }
