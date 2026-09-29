@@ -1585,8 +1585,9 @@ f - rtprio -1
         let _ = clear_gate();
     }
 
-    /// Root + systemd. Lost reply, and the start lands (passes ExecCondition) before settle expires:
-    /// has_exited() closes the gate, looks again, finds it running, and keeps owning it.
+    /// Root + systemd. Lost reply, and the start lands (passes ExecCondition) before has_exited() looks:
+    /// the first probe already sees it running, so it is confirmed and kept, then stopped. (The branch
+    /// where it appears between the gate close and the second probe needs a timing hook; not covered.)
     #[test]
     #[ignore]
     fn lost_start_that_landed_is_kept_and_stopped() {
