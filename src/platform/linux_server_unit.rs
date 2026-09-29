@@ -83,6 +83,8 @@ const FAST_FAIL_WINDOW: Duration = Duration::from_secs(10);
 const FAST_FAIL_LIMIT: u32 = 3;
 /// ... and tries units again after this long.
 const DEGRADED_RETRY: Duration = Duration::from_secs(600);
+/// Consecutive `Retry` outcomes (nothing could be sent) before degrading too: ~10 s of loop ticks.
+const RETRY_LIMIT: u32 = 20;
 /// Startup: how often to repeat the error while leftover units cannot be listed or stopped.
 const LEFTOVER_WARN_EVERY: Duration = Duration::from_secs(60);
 
@@ -625,7 +627,21 @@ impl ServerUnit {
         args: &[&str],
         envs: &[(String, String)],
     ) -> Result<ServerUnit, StartError> {
-        Self::start_inner(uid, exe, args, envs, true)
+        // A Retry that never clears (e.g. systemd's defaults unreadable) must not starve remote
+        // access: after RETRY_LIMIT in a row it becomes a degraded (sudo) window like fast failures.
+        static RETRIES: AtomicU32 = AtomicU32::new(0);
+        let res = Self::start_inner(uid, exe, args, envs, true);
+        match &res {
+            Err(StartError::Retry(_)) => {
+                if RETRIES.fetch_add(1, Ordering::Relaxed) + 1 >= RETRY_LIMIT {
+                    RETRIES.store(0, Ordering::Relaxed);
+                    FAST_FAILS.store(FAST_FAIL_LIMIT, Ordering::Relaxed);
+                    return Err(StartError::Degraded);
+                }
+            }
+            _ => RETRIES.store(0, Ordering::Relaxed),
+        }
+        res
     }
 
     /// `open_gate` = make this unit the one allowed to run (always, except in the test that plays a
