@@ -627,8 +627,58 @@ fn get_all_term_values(uid: &str) -> Vec<String> {
     terms
 }
 
+/// A running `--server`: the root/headless one is a direct child; a user's (and the greeter
+/// user's) runs in its own transient systemd unit (VNET, see linux_server_unit.rs).
+enum ServerProcess {
+    Child(Child),
+    Unit(super::linux_server_unit::ServerUnit),
+}
+
+impl ServerProcess {
+    /// Stop it. For a unit this is synchronous: every process in its cgroup is gone on return.
+    fn kill(&mut self) {
+        match self {
+            ServerProcess::Child(ps) => allow_err!(ps.kill()),
+            ServerProcess::Unit(unit) => unit.stop(),
+        }
+    }
+
+    fn has_exited(&mut self) -> bool {
+        match self {
+            ServerProcess::Child(ps) => matches!(ps.try_wait(), Ok(Some(_))),
+            ServerProcess::Unit(unit) => unit.has_exited(),
+        }
+    }
+}
+
+/// VNET: the user's server in a transient unit; the upstream sudo path only if systemd refuses
+/// (remote access must keep working).
+fn start_user_server(
+    desktop: &Desktop,
+    envs: Vec<(&str, String)>,
+) -> ResultType<Option<ServerProcess>> {
+    let exe = std::env::current_exe()?;
+    let owned: Vec<(String, String)> =
+        envs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    match super::linux_server_unit::ServerUnit::start(&desktop.uid, &exe, &["--server"], &owned) {
+        Ok(unit) => Ok(Some(ServerProcess::Unit(unit))),
+        Err(e) => {
+            log::error!(
+                "server unit for uid {} failed ({e}); falling back to sudo",
+                desktop.uid
+            );
+            Ok(run_as_user(
+                vec!["--server"],
+                Some((desktop.uid.clone(), desktop.username.clone())),
+                envs,
+            )?
+            .map(ServerProcess::Child))
+        }
+    }
+}
+
 #[inline]
-fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
+fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<ServerProcess>> {
     match desktop {
         Some(desktop) => {
             let mut envs = vec![];
@@ -651,18 +701,14 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
             ));
-            run_as_user(
-                vec!["--server"],
-                Some((desktop.uid.clone(), desktop.username.clone())),
-                envs,
-            )
+            start_user_server(desktop, envs)
         }
-        None => Ok(Some(crate::run_me(vec!["--server"])?)),
+        None => Ok(Some(ServerProcess::Child(crate::run_me(vec!["--server"])?))),
     }
 }
 
 #[inline]
-fn start_server(desktop: Option<&Desktop>, server: &mut Option<Child>) {
+fn start_server(desktop: Option<&Desktop>, server: &mut Option<ServerProcess>) {
     match try_start_server_(desktop) {
         Ok(ps) => *server = ps,
         Err(err) => {
@@ -671,17 +717,21 @@ fn start_server(desktop: Option<&Desktop>, server: &mut Option<Child>) {
     }
 }
 
-fn stop_server(server: &mut Option<Child>) {
-    if let Some(mut ps) = server.take() {
-        allow_err!(ps.kill());
-        sleep_millis(30);
-        match ps.try_wait() {
-            Ok(Some(_status)) => {}
-            Ok(None) => {
-                let _res = ps.wait();
+fn stop_server(server: &mut Option<ServerProcess>) {
+    match server.take() {
+        Some(ServerProcess::Child(mut ps)) => {
+            allow_err!(ps.kill());
+            sleep_millis(30);
+            match ps.try_wait() {
+                Ok(Some(_status)) => {}
+                Ok(None) => {
+                    let _res = ps.wait();
+                }
+                Err(e) => log::error!("error attempting to wait: {e}"),
             }
-            Err(e) => log::error!("error attempting to wait: {e}"),
         }
+        Some(ServerProcess::Unit(unit)) => unit.stop(),
+        None => {}
     }
 }
 
@@ -723,7 +773,7 @@ fn should_start_server(
     desktop: &Desktop,
     cm0: &mut bool,
     last_restart: &mut Instant,
-    server: &mut Option<Child>,
+    server: &mut Option<ServerProcess>,
 ) -> bool {
     let cm = get_cm();
     let mut start_new = false;
@@ -763,19 +813,16 @@ fn should_start_server(
 
     if should_kill {
         if let Some(ps) = server.as_mut() {
-            allow_err!(ps.kill());
+            ps.kill();
             sleep_millis(30);
             *last_restart = Instant::now();
         }
     }
 
     if let Some(ps) = server.as_mut() {
-        match ps.try_wait() {
-            Ok(Some(_)) => {
-                *server = None;
-                start_new = true;
-            }
-            _ => {}
+        if ps.has_exited() {
+            *server = None;
+            start_new = true;
         }
     } else {
         start_new = true;
@@ -793,6 +840,9 @@ fn force_stop_server() {
 
 pub fn start_os_service() {
     check_if_stop_service();
+    // VNET: server units a previous instance left behind (their whole cgroups), then upstream's
+    // name-based sweep for servers started the old way (sudo) before an upgrade.
+    super::linux_server_unit::sweep();
     stop_rustdesk_servers();
     stop_subprocess();
     start_uinput_service();
@@ -807,8 +857,8 @@ pub fn start_os_service() {
     let mut desktop = Desktop::default();
     let mut sid = "".to_owned();
     let mut uid = "".to_owned();
-    let mut server: Option<Child> = None;
-    let mut user_server: Option<Child> = None;
+    let mut server: Option<ServerProcess> = None;
+    let mut user_server: Option<ServerProcess> = None;
     if let Err(err) = ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
     }) {
@@ -883,10 +933,10 @@ pub fn start_os_service() {
     }
 
     if let Some(ps) = user_server.take().as_mut() {
-        allow_err!(ps.kill());
+        ps.kill();
     }
     if let Some(ps) = server.take().as_mut() {
-        allow_err!(ps.kill());
+        ps.kill();
     }
     log::info!("Exit");
 }

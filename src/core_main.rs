@@ -394,7 +394,12 @@ pub fn core_main() -> Option<Vec<String>> {
             #[cfg(target_os = "linux")]
             {
                 hbb_common::allow_err!(crate::platform::check_autostart_config());
+                // VNET: only this user's tray. Unscoped, it also matched the greeter user's tray
+                // (EPERM in the journal at every sign-in); the root service now stops that one
+                // together with its server's unit.
                 std::process::Command::new("pkill")
+                    .arg("-U")
+                    .arg(unsafe { hbb_common::libc::getuid() }.to_string())
                     .arg("-f")
                     .arg(&format!("{} --tray", crate::get_app_name().to_lowercase()))
                     .status()
