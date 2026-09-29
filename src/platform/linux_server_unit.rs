@@ -30,7 +30,7 @@ use dbus::{
     blocking::{Connection, Proxy},
     Path as DbusPath,
 };
-use hbb_common::{bail, log, ResultType};
+use hbb_common::{log, ResultType};
 use std::{
     cell::{Cell, RefCell},
     path::Path,
