@@ -635,10 +635,14 @@ enum ServerProcess {
 }
 
 impl ServerProcess {
-    /// Stop it. For a unit this is synchronous: every process in its cgroup is gone on return.
-    fn kill(&mut self) {
+    /// Stop it. For a unit this is synchronous: true = every process in its cgroup is gone; false =
+    /// not confirmed, the caller keeps owning it and retries. A direct child is SIGKILLed (upstream).
+    fn kill(&mut self) -> bool {
         match self {
-            ServerProcess::Child(ps) => allow_err!(ps.kill()),
+            ServerProcess::Child(ps) => {
+                allow_err!(ps.kill());
+                true
+            }
             ServerProcess::Unit(unit) => unit.stop(),
         }
     }
@@ -651,22 +655,30 @@ impl ServerProcess {
     }
 }
 
-/// VNET: the user's server in a transient unit; the upstream sudo path only if systemd refuses
-/// (remote access must keep working).
+/// VNET: the user's server in a transient unit. The upstream sudo path (which leaks the server's
+/// children when stopped) is used only when systemd provably did not create the unit, or after
+/// repeated units died right after starting -- remote access must keep working either way.
 fn start_user_server(
     desktop: &Desktop,
     envs: Vec<(&str, String)>,
 ) -> ResultType<Option<ServerProcess>> {
+    use super::linux_server_unit::{ServerUnit, StartError};
     let exe = std::env::current_exe()?;
     let owned: Vec<(String, String)> =
         envs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-    match super::linux_server_unit::ServerUnit::start(&desktop.uid, &exe, &["--server"], &owned) {
+    match ServerUnit::start(&desktop.uid, &exe, &["--server"], &owned) {
         Ok(unit) => Ok(Some(ServerProcess::Unit(unit))),
         Err(e) => {
-            log::error!(
-                "server unit for uid {} failed ({e}); falling back to sudo",
-                desktop.uid
-            );
+            match e {
+                StartError::NotCreated(e) => log::error!(
+                    "server unit for uid {} not created ({e}); DEGRADED: starting via sudo",
+                    desktop.uid
+                ),
+                StartError::Degraded => log::error!(
+                    "server units keep failing right after start; DEGRADED: starting uid {} via sudo",
+                    desktop.uid
+                ),
+            }
             Ok(run_as_user(
                 vec!["--server"],
                 Some((desktop.uid.clone(), desktop.username.clone())),
@@ -730,7 +742,12 @@ fn stop_server(server: &mut Option<ServerProcess>) {
                 Err(e) => log::error!("error attempting to wait: {e}"),
             }
         }
-        Some(ServerProcess::Unit(unit)) => unit.stop(),
+        Some(ServerProcess::Unit(unit)) => {
+            if !unit.stop() {
+                // Not confirmed gone: keep owning it; the next tick retries.
+                *server = Some(ServerProcess::Unit(unit));
+            }
+        }
         None => {}
     }
 }
@@ -765,6 +782,9 @@ fn stop_subprocess() {
         crate::get_app_name().to_lowercase(),
     ));
 }
+
+/// VNET: `uid` value meaning "a stop of the previous server is still pending" (not a valid uid).
+const PENDING_STOP_UID: &str = "pending-stop";
 
 fn should_start_server(
     try_x11: bool,
@@ -813,7 +833,13 @@ fn should_start_server(
 
     if should_kill {
         if let Some(ps) = server.as_mut() {
-            ps.kill();
+            if !ps.kill() {
+                // VNET: the old server is not confirmed gone. Never start a second one; make the next
+                // tick see a transition again (this sentinel matches no uid, headless or not) so the
+                // stop is retried until it succeeds.
+                *uid = PENDING_STOP_UID.to_owned();
+                return false;
+            }
             sleep_millis(30);
             *last_restart = Instant::now();
         }
@@ -876,9 +902,12 @@ pub fn start_os_service() {
         if desktop.username == "root" || desktop.is_login_wayland() {
             // try kill subprocess "--server"
             stop_server(&mut user_server);
+            // VNET: never start the root server next to a user server that is not confirmed gone.
+            let blocked = user_server.is_some();
             // try start subprocess "--server"
             // No need to check is_display_changed here.
-            if should_start_server(
+            if !blocked
+                && should_start_server(
                 true,
                 false,
                 &mut uid,
@@ -894,13 +923,17 @@ pub fn start_os_service() {
         } else if desktop.username != "" {
             // try kill subprocess "--server"
             stop_server(&mut server);
+            let blocked = server.is_some();
+            // A sudo-started (fallback) server leaves its children behind when stopped: sweep by name then.
+            let prev_was_child = matches!(user_server, Some(ServerProcess::Child(_)));
 
             let is_display_changed = desktop.display != display || desktop.xauth != xauth;
             display = desktop.display.clone();
             xauth = desktop.xauth.clone();
 
             // try start subprocess "--server"
-            if should_start_server(
+            if !blocked
+                && should_start_server(
                 !desktop.is_wayland(),
                 is_display_changed,
                 &mut uid,
@@ -910,13 +943,17 @@ pub fn start_os_service() {
                 &mut user_server,
             ) {
                 stop_subprocess();
-                force_stop_server();
+                // VNET: the name-based ps sweep only when the previous user server was started via sudo
+                // (fallback); a unit is stopped whole, and confirmed, in should_start_server.
+                if prev_was_child {
+                    force_stop_server();
+                }
                 start_server(Some(&desktop), &mut user_server);
             }
         } else {
-            force_stop_server();
             stop_server(&mut user_server);
             stop_server(&mut server);
+            force_stop_server();
         }
 
         let keeps_headless = sid.is_empty() && desktop.is_headless();
