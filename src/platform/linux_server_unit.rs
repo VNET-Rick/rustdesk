@@ -752,9 +752,11 @@ mod tests {
             .find(|l| l.starts_with("Max open files"))
             .unwrap();
         assert!(nofile.contains("1048576"), "{nofile}");
-        // nobody's login shell and name, from SetLoginEnvironment.
-        assert!(env.iter().any(|e| e.starts_with("SHELL=/")), "{env:?}");
+        // Login environment from the passwd entry (SetLoginEnvironment). systemd leaves SHELL unset for
+        // a nologin shell, which nobody has; a real user gets it.
         assert!(env.contains(&"LOGNAME=nobody".to_owned()), "{env:?}");
+        assert!(env.contains(&"HOME=/nonexistent".to_owned()), "{env:?}");
+        assert!(!env.iter().any(|e| e.starts_with("SHELL=") && !e.ends_with("nologin")), "{env:?}");
     }
 
     #[test]
