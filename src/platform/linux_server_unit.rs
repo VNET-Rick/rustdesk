@@ -589,7 +589,11 @@ fn close_gate_for(name: &str) -> std::io::Result<()> {
 pub fn gate_condition(name: &str) -> (String, Vec<String>, bool) {
     if !is_our_unit_name(name) {
         // Never interpolate anything else into the shell line: such a unit must never run.
-        return ("/bin/false".to_owned(), vec!["/bin/false".to_owned()], false);
+        return (
+            "/bin/false".to_owned(),
+            vec!["/bin/false".to_owned()],
+            false,
+        );
     }
     let script = format!("[ \"$(cat {GATE_FILE} 2>/dev/null)\" = \"{name}\" ]");
     (
