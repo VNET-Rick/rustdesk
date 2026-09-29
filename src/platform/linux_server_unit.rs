@@ -275,8 +275,16 @@ fn domain_priority(domain: &str, user: &str, uid: u32, groups: &[String]) -> Opt
     // uid ranges: "min:max", "min:", ":max", or "n:" (pam_limits: a user-class match).
     if let Some((lo, hi)) = domain.split_once(':') {
         if !domain.starts_with('@') && !domain.starts_with('%') {
-            let lo = if lo.is_empty() { Some(0) } else { lo.parse::<u32>().ok() };
-            let hi = if hi.is_empty() { Some(u32::MAX) } else { hi.parse::<u32>().ok() };
+            let lo = if lo.is_empty() {
+                Some(0)
+            } else {
+                lo.parse::<u32>().ok()
+            };
+            let hi = if hi.is_empty() {
+                Some(u32::MAX)
+            } else {
+                hi.parse::<u32>().ok()
+            };
             return match (lo, hi) {
                 (Some(lo), Some(hi)) if lo <= uid && uid <= hi => Some(0),
                 _ => None,
@@ -319,7 +327,10 @@ pub fn pam_limits_for(
             let Some(&(_, prop)) = LIMIT_ITEMS.iter().find(|(i, _)| *i == item) else {
                 continue;
             };
-            let unlimited = matches!(value.to_ascii_lowercase().as_str(), "unlimited" | "infinity" | "-1");
+            let unlimited = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "unlimited" | "infinity" | "-1"
+            );
             let val = if item == "nice" {
                 let n = if unlimited {
                     -1
@@ -379,7 +390,9 @@ pub fn pam_limits_for(
 /// The systemd properties for a limit set: `LimitX` = hard, `LimitXSoft` = soft, only for the sides
 /// that are set (an unset side keeps systemd's default for system units, as it did under sudo). A soft
 /// value above an explicit hard one is clamped. NOFILE defaults to what the sudo-started server had.
-pub fn limit_props_from(limits: Vec<(&'static str, Option<u64>, Option<u64>)>) -> Vec<(String, u64)> {
+pub fn limit_props_from(
+    limits: Vec<(&'static str, Option<u64>, Option<u64>)>,
+) -> Vec<(String, u64)> {
     let mut limits = limits;
     match limits.iter_mut().find(|(p, _, _)| *p == "LimitNOFILE") {
         Some(l) => {
@@ -478,7 +491,10 @@ impl ServerUnit {
         let mut at = DEGRADED_AT.lock().unwrap_or_else(|e| e.into_inner());
         let since = *at.get_or_insert_with(Instant::now);
         if since.elapsed() >= DEGRADED_RETRY {
-            log::warn!("server units: retrying after {:?} degraded", since.elapsed());
+            log::warn!(
+                "server units: retrying after {:?} degraded",
+                since.elapsed()
+            );
             FAST_FAILS.store(0, Ordering::Relaxed);
             *at = None;
             return false;
@@ -771,7 +787,9 @@ impl Leftovers {
         let pending = self.pending.as_mut().unwrap();
         pending.retain(|n| !stop_unit_by_name(n));
         if !pending.is_empty() && !self.warned {
-            log::error!("startup: leftover units not stopped yet, not starting a server: {pending:?}");
+            log::error!(
+                "startup: leftover units not stopped yet, not starting a server: {pending:?}"
+            );
             self.warned = true;
         }
         pending.is_empty()
@@ -946,6 +964,23 @@ mod tests {
         );
     }
 
+    /// Root + systemd: a unit left running (handle dropped, as after a service crash) is found and
+    /// stopped by the startup gate, which only reports clean once it is gone.
+    #[test]
+    #[ignore]
+    fn leftovers_are_stopped_before_anything_starts() {
+        let unit = ServerUnit::start("65534", Path::new("/bin/sh"), &["-c", "exec sleep 300"], &[])
+            .unwrap_or_else(|_| panic!("start"));
+        let name = unit.name().to_owned();
+        drop(unit);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(active_state(&name, PROBE_CALL), Ok(Some(s)) if s == "active"));
+        let mut leftovers = Leftovers::new();
+        assert!(leftovers.settle());
+        assert!(matches!(active_state(&name, PROBE_CALL), Ok(None)), "{name} still there");
+        assert!(leftovers.settle()); // stays clean
+    }
+
     #[test]
     fn own_unit_parses_cgroup_v2() {
         assert_eq!(
@@ -1047,19 +1082,46 @@ bob     hard core   100
         .to_owned();
         let later = "*    -  nofile 999\n".to_owned();
         let g = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let alice = pam_limits_for(&[conf.clone(), later.clone()], "alice", 1500, &g(&["staff"]), 1 << 20);
+        let alice = pam_limits_for(
+            &[conf.clone(), later.clone()],
+            "alice",
+            1500,
+            &g(&["staff"]),
+            1 << 20,
+        );
         // user line beats the group line and both later '*' lines, on both sides
-        assert!(alice.contains(&("LimitNOFILE", Some(4096), Some(4096))), "{alice:?}");
+        assert!(
+            alice.contains(&("LimitNOFILE", Some(4096), Some(4096))),
+            "{alice:?}"
+        );
         // soft-only line sets only the soft side
         assert!(alice.contains(&("LimitCORE", Some(0), None)), "{alice:?}");
         // uid range is user-class: beats the later '*'
-        assert!(alice.contains(&("LimitNPROC", Some(500), Some(500))), "{alice:?}");
-        let carol = pam_limits_for(&[conf.clone(), later.clone()], "carol", 3000, &g(&["staff"]), 1 << 20);
+        assert!(
+            alice.contains(&("LimitNPROC", Some(500), Some(500))),
+            "{alice:?}"
+        );
+        let carol = pam_limits_for(
+            &[conf.clone(), later.clone()],
+            "carol",
+            3000,
+            &g(&["staff"]),
+            1 << 20,
+        );
         // group (hard) beats '*' on the hard side; the later '*' still sets the soft side
-        assert!(carol.contains(&("LimitNOFILE", Some(999), Some(2048))), "{carol:?}");
-        assert!(carol.contains(&("LimitNPROC", Some(50), Some(50))), "{carol:?}");
+        assert!(
+            carol.contains(&("LimitNOFILE", Some(999), Some(2048))),
+            "{carol:?}"
+        );
+        assert!(
+            carol.contains(&("LimitNPROC", Some(50), Some(50))),
+            "{carol:?}"
+        );
         let bob = pam_limits_for(&[conf], "bob", 3000, &[], 1 << 20);
-        assert!(bob.contains(&("LimitCORE", Some(0), Some(100 * 1024))), "{bob:?}");
+        assert!(
+            bob.contains(&("LimitCORE", Some(0), Some(100 * 1024))),
+            "{bob:?}"
+        );
     }
 
     #[test]
@@ -1111,17 +1173,30 @@ f - rtprio -1
 
     #[test]
     fn start_errors_are_definite_only_when_systemd_cannot_have_acted() {
-        let de = |name: &str| {
-            hbb_common::anyhow::Error::from(dbus::Error::new_custom(name, "x"))
-        };
-        assert!(start_error_is_definite(&de("org.freedesktop.DBus.Error.InvalidArgs")));
-        assert!(start_error_is_definite(&de("org.freedesktop.DBus.Error.AccessDenied")));
-        assert!(start_error_is_definite(&hbb_common::anyhow::Error::from(NotSent(
-            dbus::Error::new_custom("org.freedesktop.DBus.Error.FileNotFound", "x")
-        ))));
-        assert!(!start_error_is_definite(&de("org.freedesktop.DBus.Error.NoReply")));
-        assert!(!start_error_is_definite(&de("org.freedesktop.DBus.Error.Timeout")));
-        assert!(!start_error_is_definite(&de("org.freedesktop.DBus.Error.Disconnected")));
-        assert!(!start_error_is_definite(&hbb_common::anyhow::anyhow!("other")));
+        let de = |name: &str| hbb_common::anyhow::Error::from(dbus::Error::new_custom(name, "x"));
+        assert!(start_error_is_definite(&de(
+            "org.freedesktop.DBus.Error.InvalidArgs"
+        )));
+        assert!(start_error_is_definite(&de(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        )));
+        assert!(start_error_is_definite(&hbb_common::anyhow::Error::from(
+            NotSent(dbus::Error::new_custom(
+                "org.freedesktop.DBus.Error.FileNotFound",
+                "x"
+            ))
+        )));
+        assert!(!start_error_is_definite(&de(
+            "org.freedesktop.DBus.Error.NoReply"
+        )));
+        assert!(!start_error_is_definite(&de(
+            "org.freedesktop.DBus.Error.Timeout"
+        )));
+        assert!(!start_error_is_definite(&de(
+            "org.freedesktop.DBus.Error.Disconnected"
+        )));
+        assert!(!start_error_is_definite(&hbb_common::anyhow::anyhow!(
+            "other"
+        )));
     }
 }
